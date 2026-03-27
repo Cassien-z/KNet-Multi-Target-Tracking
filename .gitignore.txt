@@ -1,0 +1,43 @@
+# ==============================
+# 1. 深度学习与数据集 (防撑爆 GitHub)
+# ==============================
+*.pth
+*.pt
+*.h5
+*.weights
+*.onnx
+# 忽略所有生成的 json 轨迹数据和原始数据集
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+# 如果 dataset_script 生成了 npy 或 csv 也忽略掉
+*.npy
+*.csv
+# 忽略特定的测试数据文件夹 (根据你的实际路径修改)
+Tracking_System/knet_backend/knet_verify_data/
+
+# ==============================
+# 2. Python 后端与缓存
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+.env
+
+# ==============================
+# 3. 前端 Vue/Vite 依赖与构建产物
+# ==============================
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# ==============================
+# 4. 操作系统缓存
+# ==============================
+.DS_Store
+Thumbs.db
