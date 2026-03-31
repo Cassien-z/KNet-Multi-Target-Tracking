@@ -4,16 +4,15 @@ import math
 
 
 class KNet_Tracker(nn.Module):
-    def __init__(self, state_dim=6, meas_dim=3, hidden_size=128):
+    def __init__(self, state_dim=6, num_sensors=3, meas_dim_per_sensor=3, hidden_size=128):
         super().__init__()
         self.state_dim = state_dim
-        self.meas_dim = meas_dim
+        self.num_sensors = num_sensors
+        self.total_meas_dim = num_sensors * meas_dim_per_sensor  # 9
 
-        input_dim = meas_dim + meas_dim + 1 + state_dim
+        input_dim = self.total_meas_dim + self.total_meas_dim + 1 + state_dim
 
         self.gru = nn.GRU(input_dim, hidden_size, batch_first=True)
-
-        # 🌟 优化 1：加入 LayerNorm 稳定长序列训练
         self.ln = nn.LayerNorm(hidden_size)
 
         self.fc = nn.Sequential(
@@ -22,132 +21,81 @@ class KNet_Tracker(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, state_dim * meas_dim)
+            nn.Linear(128, state_dim * self.total_meas_dim)
         )
 
-        # 🌟 优化 2：把归一化常量注册为 Buffer，跟随模型设备自动转移
         self.register_buffer('norm_ang', torch.tensor(math.pi))
         self.register_buffer('norm_r', torch.tensor(150000.0))
 
     def f_predict(self, x, dt):
-        """ 物理预测模型: Constant Velocity (CV) """
+        """ 恢复为最稳定的大道至简：纯 CV (匀速直线) 物理预测 """
         B = x.shape[0]
-        # 确保 dt 是 [B, 1] 形状以便广播
         if dt.dim() == 1:
             dt = dt.unsqueeze(-1)
 
+        dt_scaled = dt.squeeze(-1) * (500.0 / 150000.0)
+
         F = torch.eye(6, device=x.device).unsqueeze(0).repeat(B, 1, 1)
-        F[:, 0, 1] = dt.squeeze(-1)
-        F[:, 2, 3] = dt.squeeze(-1)
-        F[:, 4, 5] = dt.squeeze(-1)
+        F[:, 0, 1] = dt_scaled
+        F[:, 2, 3] = dt_scaled
+        F[:, 4, 5] = dt_scaled
 
         x_pred = torch.bmm(F, x.unsqueeze(-1)).squeeze(-1)
         return x_pred
 
-    def h_measure(self, x):
-        """
-        物理观测模型: Cartesian -> Spherical
-        🟢 改进 3: 增加数值稳定性保护
-        """
-        px, py, pz = x[:, 0], x[:, 2], x[:, 4]
-
-        # 防止 r=0 导致除零
-        r_sq = px ** 2 + py ** 2 + pz ** 2
-        r = torch.sqrt(r_sq + 1e-9)
-
-        # 计算方位角 (-pi, pi)
-        az = torch.atan2(py, px)
-
-        # 计算俯仰角，并裁剪输入防止 asin 报错 (防止浮点误差导致 >1)
-        sin_el = pz / (r + 1e-9)
-        sin_el = torch.clamp(sin_el, -1.0, 1.0)
-        el = torch.asin(sin_el)
-
-        return torch.stack([az, el, r], dim=1)
-
     def _wrap_angle(self, angle):
-        """
-        🟢 改进 4: 鲁棒的角度 Wrap 函数
-        将角度强制映射到 (-pi, pi]
-        """
-        # 使用 torch.remainder 或者手动处理，确保梯度流畅
-        # 方法：angle - 2*pi * round(angle / 2*pi)
         two_pi = 2.0 * math.pi
         return angle - two_pi * torch.round(angle / two_pi)
 
-    def forward(self, meas, mask, dt, prev_state, hx=None):
-        """
-        单步前向传播
-        meas: [batch, 3] (归一化后的测量: az/pi, el/pi, r/150km)
-        mask: [batch, 3]
-        dt:   [batch]
-        prev_state: [batch, 6] (归一化后的状态)
-        hx:   GRU 隐状态
-        """
-        # 1. 物理预测 (Predict)
-        x_minus = self.f_predict(prev_state, dt)
+    def forward(self, meas, mask, dt, x_prev=None, hx=None):
+        batch_size = meas.shape[0]
 
-        # 2. 观测预测 (从归一化状态反推归一化观测)
-        # 注意：h_measure 输出的是物理值 (弧度, 米)，需要归一化以匹配 meas
-        y_pred_phys = self.h_measure(x_minus)
+        if x_prev is None:
+            x_prev = torch.zeros(batch_size, self.state_dim, device=meas.device)
 
-        # 🌟 优化 3：替换硬编码的 math.pi 和 150000.0
+        # 1. 物理模型预测 (不再需要 v_last)
+        x_minus = self.f_predict(x_prev, dt)
+
+        # 2. 提取物理观测 [az, el, r]
+        y_pred_phys = torch.zeros(batch_size, 3, device=meas.device)
+        y_pred_phys[:, 0] = torch.atan2(x_minus[:, 2], x_minus[:, 0])
+        r_xy = torch.sqrt(x_minus[:, 0] ** 2 + x_minus[:, 2] ** 2 + 1e-9)
+        y_pred_phys[:, 1] = torch.atan2(x_minus[:, 4], r_xy)
+        y_pred_phys[:, 2] = torch.sqrt(x_minus[:, 0] ** 2 + x_minus[:, 2] ** 2 + x_minus[:, 4] ** 2 + 1e-9)
+
+        # 归一化预测值
         y_pred = y_pred_phys.clone()
-        y_pred[:, 0] = y_pred_phys[:, 0] / self.norm_ang  # Az
-        y_pred[:, 1] = y_pred_phys[:, 1] / self.norm_ang  # El
-        y_pred[:, 2] = y_pred_phys[:, 2] / self.norm_r  # Range
+        y_pred[:, 0] = y_pred_phys[:, 0] / self.norm_ang
+        y_pred[:, 1] = y_pred_phys[:, 1] / self.norm_ang
+        y_pred[:, 2] = y_pred_phys[:, 2]
 
-        # 3. 计算 Innovation (残差)
-        innov = meas - y_pred
+        # 3. 计算残差
+        meas_3d = meas.view(batch_size, self.num_sensors, 3)
+        y_pred_3d = y_pred.unsqueeze(1).expand(-1, self.num_sensors, -1)
+        innov_3d = meas_3d - y_pred_3d
+        innov_3d[:, :, 0] = self._wrap_angle(innov_3d[:, :, 0] * self.norm_ang.item()) / self.norm_ang.item()
+        innov_3d[:, :, 1] = self._wrap_angle(innov_3d[:, :, 1] * self.norm_ang.item()) / self.norm_ang.item()
+        innov = innov_3d.view(batch_size, self.total_meas_dim)
 
-        # 🟢 关键：对角度残差进行 Wrap 处理
-        # 只处理前两个维度 (az, el)
-        innov[:, 0] = self._wrap_angle(innov[:, 0])  # 此时 innov 已是归一化的 (-1, 1) 对应 (-pi, pi)
-        innov[:, 1] = self._wrap_angle(innov[:, 1])
+        # 4. 掩码
+        innov = innov * mask
 
-        # 注意：上面的 _wrap_angle 是针对弧度设计的。
-        # 如果 innov 已经是归一化值 (-1 ~ 1)，则应该 wrap 到 (-1, 1)
-        # 修正：因为 y_pred 和 meas 都是除以 pi 后的值，范围是 (-1, 1)
-        # 所以残差范围理论上是 (-2, 2)。我们需要将其 wrap 回 (-1, 1) 对应的区间吗？
-        # 不，残差应该是弧度差除以 pi。
-        # 正确的做法：先还原成弧度，wrap，再归一化。
-
-        # --- 重新修正残差计算逻辑 (更稳妥) ---
-        # 1. 还原为物理弧度
-        innov_az_rad = (meas[:, 0] - y_pred[:, 0]) * self.norm_ang.item()
-        innov_el_rad = (meas[:, 1] - y_pred[:, 1]) * self.norm_ang.item()
-        innov_r = meas[:, 2] - y_pred[:, 2]  # 距离残差 (归一化后)
-
-        # 2. Wrap 角度残差
-        innov_az_rad = self._wrap_angle(innov_az_rad)
-        innov_el_rad = self._wrap_angle(innov_el_rad)
-
-        # 3. 重新归一化残差，作为 RNN 输入
-        innov[:, 0] = innov_az_rad / self.norm_ang.item()
-        innov[:, 1] = innov_el_rad / self.norm_ang.item()
-        innov[:, 2] = innov_r
-
-        # 4. 神经网络计算增益 K
-        # 拼接特征: [Innovation, Mask, dt, x_minus]
-        # 确保 dt 维度正确 [B, 1]
-        if dt.dim() == 1:
-            dt_input = dt.unsqueeze(-1)
-        else:
-            dt_input = dt
-
+        # 5. RNN 状态更新
+        dt_input = dt.unsqueeze(-1) if dt.dim() == 1 else dt
         rnn_in = torch.cat([innov, mask, dt_input, x_minus], dim=1).unsqueeze(1)
         gru_out, hx_new = self.gru(rnn_in, hx)
-
-        # 🌟 优化 4：在喂给全连接层之前，过一下 LayerNorm
         gru_out = self.ln(gru_out)
 
-        K = self.fc(gru_out[:, -1, :]).view(-1, 6, 3)
+        # 6. 提取增益 (🌟 保留这个能救命的 Tanh 修复)
+        K = self.fc(gru_out[:, -1, :]).view(-1, self.state_dim, self.total_meas_dim)
 
-        # 5. 混合修正 (Update)
-        # 应用 Mask (如果某个传感器无效，强制该维度残差为 0)
-        innov_masked = innov * mask
+        # K = torch.tanh(K) * 0.2
+        K = torch.clamp(K, min=-3.0, max=3.0)
 
-        correction = torch.bmm(K, innov_masked.unsqueeze(-1)).squeeze(-1)
+        innov_col = innov.unsqueeze(-1)
+        correction = torch.bmm(K, innov_col).squeeze(-1)
+
         x_new = x_minus + correction
+        x_new = torch.clamp(x_new, min=-5.0, max=5.0)
 
         return x_new, hx_new
