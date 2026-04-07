@@ -71,15 +71,14 @@ def train():
             mask_input = batch_data['mask_input'].to(DEVICE)
             mask_loss = batch_data['mask_loss'].to(DEVICE)
             dt = batch_data['dt'].to(DEVICE)
+            baselines = batch_data['baselines'].to(DEVICE)
 
             Batch, Time, _ = states.shape
 
-            # 抗惊吓训练法：从 0 速度、带误差起点开始
             x_prev = torch.zeros_like(states[:, 0, :])
             x_prev[:, [0, 2, 4]] = states[:, 0, [0, 2, 4]] + torch.randn_like(states[:, 0, [0, 2, 4]]) * 0.05
             x_prev[:, [1, 3, 5]] = 0.0
 
-            # ... 前面代码 ...
             hx = None
             optimizer.zero_grad()
             pred_states = []
@@ -88,13 +87,13 @@ def train():
                 dt_t = dt[:, t]
                 meas_t = meas[:, t, :]
                 mask_t = mask_input[:, t, :]
+                base_t = baselines[:, t, :]  # 🌟 当前帧的僚机基线
 
-                # 🌟 去掉 v_last
-                x_pred, hx = model(meas_t, mask_t, dt_t, x_prev, hx)
+                # 🌟 传入 base_t
+                x_pred, hx = model(meas_t, mask_t, dt_t, base_t, x_prev, hx)
 
                 pred_states.append(x_pred)
                 x_prev = x_pred
-            # ... 后面计算 Cosine Loss 的代码完全保持不变 ...
 
             pred_states = torch.stack(pred_states, dim=1)
 

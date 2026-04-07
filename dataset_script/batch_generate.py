@@ -4,7 +4,7 @@ from script import run_simulation  # 确保 script.py 在当前目录
 
 
 def start_batch_work(count):
-    save_dir = "knet_train_data"
+    save_dir = "knet_verify_data"
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
@@ -19,4 +19,4 @@ def start_batch_work(count):
 
 
 if __name__ == "__main__":
-    start_batch_work(50)
+    start_batch_work(10)

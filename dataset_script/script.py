@@ -19,6 +19,58 @@ from datetime import timedelta
 from stonesoup.types.groundtruth import GroundTruthPath, GroundTruthState
 from stonesoup.types.detection import TrueDetection
 
+import collections
+
+
+class DatalinkNode:
+    """数据链模拟节点（部署在僚机上）"""
+
+    def __init__(self, delay_s, interval_s, noise_ang_rad, noise_r_m):
+        self.delay_s = delay_s  # 传输延迟 (例如 1.0秒)
+        self.interval_s = interval_s  # 更新周期 (例如 1.0秒)
+        self.noise_ang = noise_ang_rad  # 角度退化精度 (例如 0.010 rad)
+        self.noise_r = noise_r_m  # 距离退化精度 (例如 100 m)
+
+        self.queue = collections.deque()  # 延迟缓冲区
+        self.last_tx_time = -999.0  # 上次发送时间
+
+    def ingest_data(self, current_time_s, platform_state, sensor_outputs):
+        """僚机产生观测后，送入数据链"""
+        # 1. 模拟更新周期 (降采样)
+        if current_time_s - self.last_tx_time >= self.interval_s - 1e-5:
+            # 2. 注入数据链精度退化噪声 (仅对观测值，不破坏平台真实位置记录)
+            degraded_sensors = {}
+            for s_name, s_data in sensor_outputs.items():
+                degraded_obs = []
+                for obs in s_data["observations"]:
+                    az, el, r = obs["meas"]
+                    # 叠加上数据链的额外高斯噪声
+                    noisy_az = az + np.random.randn() * self.noise_ang
+                    noisy_el = el + np.random.randn() * self.noise_ang
+                    noisy_r = r + np.random.randn() * self.noise_r
+                    degraded_obs.append({"meas": [noisy_az, noisy_el, noisy_r], "type": obs["type"]})
+                degraded_sensors[s_name] = {"observations": degraded_obs}
+
+            # 3. 打包放入队列，标记“到达长机的时间”
+            arrival_time = current_time_s + self.delay_s
+            self.queue.append({
+                "arrival_time": arrival_time,
+                "data_age": self.delay_s,
+                "platform_state": platform_state.copy(),  # 必须记录僚机当时的物理坐标
+                "sensors": degraded_sensors
+            })
+            self.last_tx_time = current_time_s
+
+    def get_arrived_data(self, master_time_s):
+        """长机提取当前已到达的最新数据"""
+        latest_data = None
+        # 把所有早于等于长机当前时间的数据包都拆开，只保留最新的一个
+        while self.queue and self.queue[0]["arrival_time"] <= master_time_s + 1e-5:
+            latest_data = self.queue.popleft()
+
+        # 注意：由于是按周期更新，如果这帧没有新数据到达，长机应该保持上一次的数据（零阶保持）
+        # 在实际代码里，我们可以返回最新数据，让外部主循环决定是否缓存。
+        return latest_data
 
 class CSSWAccelerationModel:
     """
@@ -476,88 +528,111 @@ def run_simulation(seed=None, initial_target=None):
     if seed is not None:
         np.random.seed(seed)
 
-    # 如果外部没有指定初始状态，则在这里生成随机初始状态
-    if initial_target is None:
-        initial_target = [
-            np.random.uniform(100000, 150000), np.random.uniform(-200, 200), # X, Vx
-            np.random.uniform(-5000, 5000),   np.random.uniform(20, 80),     # Y, Vy
-            np.random.uniform(8000, 12000),   np.random.uniform(20, 80) # Z, Vz
-        ]
+    # === 1. 生成目标的 GroundTruth 轨迹 ===
+    truth = generate_maneuvering_target(START_TIME, DURATION, DT, initial_target)
 
-    # 【关键修复】将随机生成的 initial_target 传给 truth 生成函数
-    truth = generate_maneuvering_target(START_TIME, DURATION, DT, initial_target=initial_target)
-    platform, sensors = create_sensor_platform(START_TIME)
+    # === 2. 初始化编队平台 ===
+    # 长机 (Master 0) - 零延迟
+    master_motion = GuidedPlatformModel(
+        init_pos=[0.0, 0.0, 10000.0], init_vel=[250.0, 0.0, 0.0], dt=DT, gain=2.5, max_acc=40.0)
 
-    radar = sensors[0]
-    eo = sensors[1] if len(sensors) > 1 else None
+    # 僚机 1 (Wingman 1 - 左侧 10km) -> 挂载 快数据链
+    wm1_motion = GuidedPlatformModel(
+        init_pos=[0.0, 10000.0, 10000.0], init_vel=[250.0, 0.0, 0.0], dt=DT, gain=2.5, max_acc=40.0)
+    datalink_wm1 = DatalinkNode(delay_s=0.1, interval_s=0.1, noise_ang_rad=0.005, noise_r_m=100.0)
 
-    # 初始化上次测量时间
-    last_measurement_time = {
-        idx: START_TIME - period
-        for idx, period in SENSOR_MEASUREMENT_PERIODS.items()
-    }
+    # 🌟 重点修改这里：僚机 2 (Wingman 2 - 右后方 10km) -> 也统一挂载 快数据链
+    wm2_motion = GuidedPlatformModel(
+        init_pos=[-5000.0, -10000.0, 10000.0], init_vel=[250.0, 0.0, 0.0], dt=DT, gain=2.5, max_acc=40.0)
+    datalink_wm2 = DatalinkNode(delay_s=0.1, interval_s=0.1, noise_ang_rad=0.005, noise_r_m=100.0)
 
-    platform_motion = GuidedPlatformModel(
-        init_pos=[0.0, 0.0, 10000.0],
-        init_vel=[250.0, 0.0, 0.0],
-        dt=DT,
-        gain=2.5,
-        max_acc=40.0
-    )
+    platforms_info = [
+        {"id": "master_0", "motion": master_motion, "is_master": True, "datalink": None},
+        {"id": "wingman_1", "motion": wm1_motion, "is_master": False, "datalink": datalink_wm1},
+        {"id": "wingman_2", "motion": wm2_motion, "is_master": False, "datalink": datalink_wm2},
+    ]
 
+    # 给每个平台分配一套独立的传感器实例，并初始化最后测量时间
+    for p in platforms_info:
+        _, p["sensors"] = create_sensor_platform(START_TIME)
+        p["last_meas_time"] = {idx: START_TIME - period for idx, period in SENSOR_MEASUREMENT_PERIODS.items()}
+        # 缓存僚机的最后一帧有效数据（用于零阶保持）
+        p["cached_arrived_data"] = None
+
+    # === 3. 核心仿真循环 ===
     dataset = []
-
     for state in truth:
-        current_time = state.timestamp
+        current_time_s = float((state.timestamp - START_TIME).total_seconds())
         target_pos = [state.state_vector[0], state.state_vector[2], state.state_vector[4]]
 
-        # --- 关键：根据目标当前位置更新平台 ---
-        p_pos, p_vel, p_acc = platform_motion.step(target_pos)
+        frame_platforms_data = {}
 
-        # 2. 【核心修复】创建并同步状态对象
-        new_p_state = GroundTruthState(
-            [p_pos[0], p_vel[0], p_pos[1], p_vel[1], p_pos[2], p_vel[2]],
-            timestamp=current_time
-        )
-        # 必须 append，否则 platform.state 不会更新
-        platform.states.append(new_p_state)
+        # 遍历编队中的每一架飞机
+        for p in platforms_info:
+            # 更新平台自身物理状态
+            p_pos, p_vel, p_acc = p["motion"].step(target_pos)
+            new_p_state = GroundTruthState(
+                [p_pos[0], p_vel[0], p_pos[1], p_vel[1], p_pos[2], p_vel[2]],
+                timestamp=state.timestamp
+            )
 
-        sensor_outputs = {}
+            # --- 传感器测量逻辑 (恢复实际的测量触发机制) ---
+            sensor_outputs = {}
+            for idx, sensor in enumerate(p["sensors"]):
+                period = SENSOR_MEASUREMENT_PERIODS[idx]
+                # 判断当前时间是否达到了传感器的更新周期
+                if state.timestamp - p["last_meas_time"][idx] >= period - timedelta(microseconds=10):
+                    detections = sensor.measure([state], platform_state=new_p_state)
+                    obs_list = []
+                    for d in detections:
+                        if isinstance(d, TrueDetection):
+                            # 转为 [az, el, r] 格式
+                            az, el, r = reorder_measurement(d.state_vector)
+                            obs_list.append({"meas": [az, el, r], "type": "true"})
 
-        # --- 遍历所有传感器进行测量 ---
-        for idx, sensor in enumerate(sensors):
-            period = SENSOR_MEASUREMENT_PERIODS[idx]
+                    if obs_list:
+                        sensor_outputs[f"sensor_{idx}"] = {"observations": obs_list}
 
-            # 1. 恢复周期检查 (只有到达采样时间才测量)
-            if (current_time - last_measurement_time[idx]) >= (period - timedelta(microseconds=1)):
-                dets = sensor.measure(
-                    {state},
-                    timestamp=current_time,
-                    platform_state=new_p_state
-                )
-                last_measurement_time[idx] = current_time
+                    p["last_meas_time"][idx] = state.timestamp
 
-                obs_list = []
-                for d in dets:
-                    vec = reorder_measurement(d.state_vector)
-                    obs_list.append({
-                        "meas": vec,
-                        "type": "true" if isinstance(d, TrueDetection) else "clutter"
-                    })
-
-                # 2. 关键：直接赋值，不要用 for-else
-                sensor_outputs[f"sensor_{idx}"] = {"observations": obs_list}
+            # --- 数据链处理逻辑 ---
+            if p["is_master"]:
+                # 长机：直接享受无延迟、无损的传感器数据
+                frame_platforms_data[p["id"]] = {
+                    "data_age": 0.0,
+                    "platform_state": new_p_state.state_vector.flatten().tolist(),
+                    "sensors": sensor_outputs
+                }
             else:
-                # 未到采样时间，输出空
-                sensor_outputs[f"sensor_{idx}"] = {"observations": []}
+                # 僚机：先将刚出炉的数据灌入数据链 (即使 sensor_outputs 是空的，也要维持平台状态的更新)
+                p["datalink"].ingest_data(
+                    current_time_s,
+                    new_p_state.state_vector.flatten().tolist(),
+                    sensor_outputs
+                )
+
+                # 然后长机尝试从该数据链中提取“已经到达”的数据包
+                arrived_data = p["datalink"].get_arrived_data(current_time_s)
+
+                if arrived_data is not None:
+                    p["cached_arrived_data"] = arrived_data  # 更新缓存
+
+                # 如果有缓存数据，则写入当前帧；如果没有（比如仿真第一秒），则写入缺省值
+                if p["cached_arrived_data"]:
+                    frame_platforms_data[p["id"]] = p["cached_arrived_data"]
+                else:
+                    # 慢数据链还没建立首次通信
+                    frame_platforms_data[p["id"]] = {
+                        "data_age": -1.0,
+                        "platform_state": None,
+                        "sensors": {}
+                    }
 
         # --- 存帧 ---
         dataset.append({
-            "time_s": float((current_time - START_TIME).total_seconds()),
+            "time_s": current_time_s,
             "ground_truth_state": [float(x) for x in state.state_vector.flatten()],
-            # 🟢 修复：直接使用当前循环生成的 new_p_state
-            "platform_state": new_p_state.state_vector.flatten().tolist(),
-            "sensors": sensor_outputs
+            "platforms": frame_platforms_data
         })
 
     return dataset

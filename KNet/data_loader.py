@@ -3,138 +3,173 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import json
-import math
 import os
 
-# 🟢 统一归一化配置 (必须与 inference.py 和 knet_model.py 严格一致)
+# 🟢 统一归一化配置
 NORM_POS = 150000.0  # 150km
 NORM_VEL = 500.0  # 500m/s
 NORM_R = 150000.0  # 150km
 NORM_ANG = np.pi  # 角度除以 pi
 
 
-def wrap_to_pi(angle):
-    """将角度映射到 [-pi, pi]"""
-    return (angle + np.pi) % (2 * np.pi) - np.pi
-
-
 class MultiTrackingDataset(Dataset):
-    def __init__(self, data_dir, seq_length=600, seq_len=None):
-        """
-        初始化数据集
-        :param seq_length: 序列长度 (优先使用)
-        :param seq_len: 兼容旧代码的参数别名
-        """
-        # 兼容处理：如果传了 seq_len 则使用它
+    def __init__(self, data_dir, seq_length=100, seq_len=None):
         if seq_len is not None:
             self.seq_length = seq_len
         else:
             self.seq_length = seq_length
-
         self.data_dir = data_dir
-
-        if not os.path.exists(data_dir):
-            raise FileNotFoundError(f"数据目录不存在：{data_dir}")
-
         self.files = sorted([f for f in os.listdir(data_dir) if f.endswith('.json')])
-
-        if not self.files:
-            raise ValueError(f"未在 {data_dir} 找到任何 JSON 文件")
-
-        print(f"📂 加载数据集：{len(self.files)} 个轨迹文件 (Dir: {data_dir})")
+        print(f"📂 加载多机协同数据集：{len(self.files)} 个文件 (Dir: {data_dir})")
 
     def __len__(self):
         return len(self.files)
 
-    def __getitem__(self, idx):
-        file_path = os.path.join(self.data_dir, self.files[idx])
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as e:
-            raise e
+    def _extract_platform_data(self, p_data, p_state):
+        """提取单个平台的 9维测量 和 9维掩码，并进行空间配准"""
+        meas_arr = np.zeros(9, dtype=np.float32)
+        mask_arr = np.zeros(9, dtype=np.float32)
 
-        states = []
-        all_meas = []
-        all_masks = []  # 🌟 新增：记录每个时间步的 9 维细粒度掩码
-        times = []
-        # 如果数据长度超过设定长度，截取；如果不足，保留原长 (collate_fn会处理padding)
-        # 这里我们先读取全部，后续在 collate_fn 或 train 中处理截断，或者在这里截断
-        # 为了简单，这里读取全部，由 collate_fn 处理
+        if p_data is None or p_state is None:
+            return meas_arr, mask_arr
+
+        # 获取平台速度
+        vx, vy, vz = p_state[1], p_state[3], p_state[5]
+        sensors = p_data.get('sensors', {})
+
+        if 'sensor_0' in sensors and sensors['sensor_0']['observations']:
+            meas = sensors['sensor_0']['observations'][0]['meas']
+            # 🌟 配准：Body -> World
+            az_w, el_w, r_w = convert_body_to_world_meas(meas[0], meas[1], meas[2], vx, vy, vz)
+            meas_arr[0:3] = [az_w, el_w, r_w]
+            mask_arr[0:3] = [1.0, 1.0, 1.0]
+
+        if 'sensor_1' in sensors and sensors['sensor_1']['observations']:
+            meas = sensors['sensor_1']['observations'][0]['meas']
+            # 🌟 配准：缺省距离用 1.0 代替运算
+            az_w, el_w, _ = convert_body_to_world_meas(meas[0], meas[1], 1.0, vx, vy, vz)
+            meas_arr[3:6] = [az_w, el_w, 0.0]
+            mask_arr[3:6] = [1.0, 1.0, 0.0]
+
+        if 'sensor_2' in sensors and sensors['sensor_2']['observations']:
+            meas = sensors['sensor_2']['observations'][0]['meas']
+            # 🌟 配准：缺省仰角 0.0，距离 1.0
+            az_w, _, _ = convert_body_to_world_meas(meas[0], 0.0, 1.0, vx, vy, vz)
+            meas_arr[6:9] = [az_w, 0.0, 0.0]
+            mask_arr[6:9] = [1.0, 0.0, 0.0]
+
+        return meas_arr, mask_arr
+
+    def __getitem__(self, idx):
+        with open(os.path.join(self.data_dir, self.files[idx]), 'r') as f:
+            data = json.load(f)
+
+        states, baselines, all_meas, all_masks, times = [], [], [], [], []
 
         for frame in data:
-            # 提取真值
             gt_w = np.array(frame['ground_truth_state'])
-            p_w = np.array(frame['platform_state'])
-            gt_rel = gt_w[[0, 2, 4]] - p_w[[0, 2, 4]]
-            vel_rel = gt_w[[1, 3, 5]] - p_w[[1, 3, 5]]
-            states.append([gt_rel[0], vel_rel[0], gt_rel[1], vel_rel[1], gt_rel[2], vel_rel[2]])
+            platforms = frame.get('platforms', {})
 
-            # 🌟 新增：多传感器量测扩维与掩码生成
-            frame_meas = np.zeros(9, dtype=np.float32)
-            frame_mask = np.zeros(9, dtype=np.float32)
-            sensors = frame.get('sensors', {})
+            master = platforms.get('master_0', {})
+            wm1 = platforms.get('wingman_1', {})
+            wm2 = platforms.get('wingman_2', {})
 
-            # 1. 雷达 (Sensor_0): [az, el, r]
-            if 'sensor_0' in sensors and sensors['sensor_0']['observations']:
-                meas = sensors['sensor_0']['observations'][0]['meas']
-                frame_meas[0:3] = meas
-                frame_mask[0:3] = [1.0, 1.0, 1.0]
+            # 必须有长机状态，否则跳过
+            if master.get("platform_state") is None: continue
 
-            # 2. 光电 (Sensor_1): [az, el]
-            if 'sensor_1' in sensors and sensors['sensor_1']['observations']:
-                meas = sensors['sensor_1']['observations'][0]['meas']
-                frame_meas[3:6] = [meas[0], meas[1], 0.0]
-                frame_mask[3:6] = [1.0, 1.0, 0.0] # 距离项无数据
+            m_state = np.array(master["platform_state"])
+            wm1_state = np.array(wm1["platform_state"]) if wm1.get("platform_state") else m_state
+            wm2_state = np.array(wm2["platform_state"]) if wm2.get("platform_state") else m_state
 
-            # 3. 电子战 (Sensor_2): [az]
-            if 'sensor_2' in sensors and sensors['sensor_2']['observations']:
-                meas = sensors['sensor_2']['observations'][0]['meas']
-                frame_meas[6:9] = [meas[0], 0.0, 0.0]
-                frame_mask[6:9] = [1.0, 0.0, 0.0] # 俯仰、距离项无数据
+            # 1. 目标相对长机的状态
+            gt_rel = gt_w - m_state
+            states.append([gt_rel[0], gt_rel[1], gt_rel[2], gt_rel[3], gt_rel[4], gt_rel[5]])
 
-            all_meas.append(frame_meas)
-            all_masks.append(frame_mask)
+            # 2. 僚机相对长机的基线向量 (Wingman - Master)
+            base1 = wm1_state - m_state
+            base2 = wm2_state - m_state
+            baselines.append(np.concatenate([base1, base2]))
+
+            # 3. 提取 3 个平台的量测 (27维)
+            m_meas, m_mask = self._extract_platform_data(master, m_state)
+            w1_meas, w1_mask = self._extract_platform_data(wm1, wm1_state)
+            w2_meas, w2_mask = self._extract_platform_data(wm2, wm2_state)
+
+            all_meas.append(np.concatenate([m_meas, w1_meas, w2_meas]))
+            all_masks.append(np.concatenate([m_mask, w1_mask, w2_mask]))
             times.append(frame['time_s'])
 
-        # ========== 归一化逻辑 ==========
-        # 🌟 修复：新增状态真值的归一化逻辑
+        # ========== 归一化 ==========
         norm_states = np.array(states, dtype=np.float32)
         norm_states[:, [0, 2, 4]] /= NORM_POS
         norm_states[:, [1, 3, 5]] /= NORM_VEL
 
-        # 下面保留原有的量测归一化逻辑
+        # 基线向量同样需要归一化 (让网络在同一尺度下运算)
+        norm_bases = np.array(baselines, dtype=np.float32)
+        norm_bases[:, [0, 2, 4, 6, 8, 10]] /= NORM_POS
+        norm_bases[:, [1, 3, 5, 7, 9, 11]] /= NORM_VEL
+
         norm_meas = np.array(all_meas, dtype=np.float32)
-        # 对所有的方位角和俯仰角位置（0,1, 3,4, 6）进行角度归一化
-        norm_meas[:, [0, 1, 3, 4, 6]] /= NORM_ANG
-        # 对雷达斜距（2）进行归一化（光电和电子战对应位置为0，除法不受影响）
-        norm_meas[:, 2] /= NORM_R
+        # 27维中，角度索引和距离索引规律排布
+        ang_idx = [0, 1, 3, 4, 6, 9, 10, 12, 13, 15, 18, 19, 21, 22, 24]
+        r_idx = [2, 11, 20]
+        norm_meas[:, ang_idx] /= NORM_ANG
+        norm_meas[:, r_idx] /= NORM_R
 
-        # ... (前面保留你的归一化逻辑和 dt 计算逻辑) ...
-
-        # 计算 dt
-        if len(times) > 1:
-            dts = np.diff(times)
-            first_dt = times[1] - times[0]
-            dts = np.insert(dts, 0, first_dt)
-        else:
-            dts = np.array([0.1])
+        dts = np.diff(times, prepend=times[0] if len(times) == 1 else times[1] - times[0])
         dts = np.array(dts, dtype=np.float32)
 
-        # 🌟 修复：在这里执行截断！防止超长序列导致 GPU OOM
         if len(norm_states) > self.seq_length:
             norm_states = norm_states[:self.seq_length]
+            norm_bases = norm_bases[:self.seq_length]
             norm_meas = norm_meas[:self.seq_length]
             all_masks = all_masks[:self.seq_length]
             dts = dts[:self.seq_length]
 
         return {
-            'states': torch.tensor(norm_states, dtype=torch.float32),
-            'meas': torch.tensor(norm_meas, dtype=torch.float32),
+            'states': torch.tensor(norm_states),
+            'baselines': torch.tensor(norm_bases),  # 🌟 新增：[12]维的编队几何信息
+            'meas': torch.tensor(norm_meas),  # 🌟 扩展为 27 维
             'mask': torch.tensor(np.array(all_masks), dtype=torch.float32),
-            'dt': torch.tensor(dts, dtype=torch.float32),
-            'file_name': self.files[idx]
+            'dt': torch.tensor(dts)
         }
+
+def convert_body_to_world_meas(az_body, el_body, r_body, vx, vy, vz):
+    """
+    将机载坐标系下的观测值，利用飞机速度矢量，配准到世界坐标系
+    """
+    # 1. 计算身体坐标系下的单位/实际方向向量 (若只有角度，用 r=1.0 替代)
+    r_calc = r_body if r_body > 0 else 1.0
+    vec_body = np.array([
+        r_calc * np.cos(el_body) * np.cos(az_body),
+        r_calc * np.cos(el_body) * np.sin(az_body),
+        r_calc * np.sin(el_body)
+    ])
+
+    # 2. 计算机载到世界的旋转矩阵 (基于速度矢量)
+    v = np.array([vx, vy, vz])
+    speed = np.linalg.norm(v)
+    if speed < 1e-6:
+        R_b2w = np.eye(3)
+    else:
+        unit_x = v / speed
+        unit_y = np.cross([0, 0, 1], unit_x)
+        if np.linalg.norm(unit_y) < 1e-6:
+            unit_y = np.array([0, 1, 0])
+        else:
+            unit_y /= np.linalg.norm(unit_y)
+        unit_z = np.cross(unit_x, unit_y)
+        R_b2w = np.column_stack((unit_x, unit_y, unit_z))
+
+    # 3. 旋转到世界坐标系
+    vec_world = R_b2w @ vec_body
+
+    # 4. 反解世界坐标系下的 az, el
+    r_xy = np.sqrt(vec_world[0]**2 + vec_world[1]**2)
+    az_world = np.arctan2(vec_world[1], vec_world[0])
+    el_world = np.arctan2(vec_world[2], r_xy)
+
+    return az_world, el_world, r_body
 
 
 def collate_fn(batch):
@@ -142,27 +177,24 @@ def collate_fn(batch):
     max_len = max(lengths)
     batch_size = len(batch)
 
-    # Padding
     padded_states = torch.zeros(batch_size, max_len, 6)
-    padded_meas = torch.zeros(batch_size, max_len, 9) # 🌟 测量维度变为 9
-    padded_mask_input = torch.zeros(batch_size, max_len, 9) # 🌟 细粒度掩码维度变为 9
+    padded_bases = torch.zeros(batch_size, max_len, 12)
+    padded_meas = torch.zeros(batch_size, max_len, 27)
+    padded_mask_input = torch.zeros(batch_size, max_len, 27)
     padded_dt = torch.zeros(batch_size, max_len)
-
-    # Loss 掩码保持 1 维 (表示该帧是否有效)
     mask_loss = torch.zeros(batch_size, max_len)
 
     for i, item in enumerate(batch):
         seq_len = item['states'].shape[0]
         padded_states[i, :seq_len, :] = item['states']
+        padded_bases[i, :seq_len, :] = item['baselines']
         padded_meas[i, :seq_len, :] = item['meas']
-        padded_mask_input[i, :seq_len, :] = item['mask'] # 🌟 填入细粒度掩码
+        padded_mask_input[i, :seq_len, :] = item['mask']
         padded_dt[i, :seq_len] = item['dt']
         mask_loss[i, :seq_len] = 1.0
 
     return {
-        'states': padded_states,
-        'meas': padded_meas,
-        'mask_input': padded_mask_input, # 🌟 给网络输入的 9 维 Mask
-        'mask_loss': mask_loss,          # 给损失函数的 1 维 Mask
-        'dt': padded_dt
+        'states': padded_states, 'baselines': padded_bases,
+        'meas': padded_meas, 'mask_input': padded_mask_input,
+        'mask_loss': mask_loss, 'dt': padded_dt
     }
