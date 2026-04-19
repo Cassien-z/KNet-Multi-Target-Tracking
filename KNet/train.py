@@ -6,18 +6,19 @@ from torch.utils.data import DataLoader
 from data_loader import MultiTrackingDataset, collate_fn
 from knet_model import KNet_Tracker
 import os
+import math
 
 # ================= 配置区域 =================
 DATA_DIR = "knet_train_data"
 BATCH_SIZE = 32
-EPOCHS = 100
+EPOCHS = 200
 LEARNING_RATE = 1e-5
 SEQ_LEN = 100  # 🌟 终极修复 2：从 600 改为 100（甚至是 50），极大降低梯度爆炸概率
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 🟢 配置：是否微调
 DO_FINE_TUNE = True
-MODEL_PATH = "knet_weights.pth"
+MODEL_PATH = "knet_weights_finetuned.pth"
 SAVE_PATH = "knet_weights_finetuned.pth" if DO_FINE_TUNE else "knet_weights.pth"
 
 # ===========================================
@@ -58,15 +59,15 @@ def train():
         model.train()
         total_loss = 0.0
         count_batches = 0
+        avg_pos_rmse_m = 0.0
 
         for batch_data in loader:
             states = batch_data['states'].to(DEVICE)
             meas = batch_data['meas'].to(DEVICE)
 
-            # 🌟 检查数据是否有 NaN
             if torch.isnan(states).any() or torch.isnan(meas).any():
                 print("⚠️ 警告：DataLoader 加载到了 NaN 数据，请检查 JSON 文件！")
-                continue  # 跳过这个有毒的 batch
+                continue
 
             mask_input = batch_data['mask_input'].to(DEVICE)
             mask_loss = batch_data['mask_loss'].to(DEVICE)
@@ -75,61 +76,83 @@ def train():
 
             Batch, Time, _ = states.shape
 
-            x_prev = torch.zeros_like(states[:, 0, :])
-            x_prev[:, [0, 2, 4]] = states[:, 0, [0, 2, 4]] + torch.randn_like(states[:, 0, [0, 2, 4]]) * 0.05
-            x_prev[:, [1, 3, 5]] = 0.0
+            # ==============================================================
+            # 🌟 FIX 1: Realistic "Cold Start" Initialization
+            # Instead of True State + Noise, use the raw Master radar measurement
+            # to initialize x_prev, exactly like inference.py does.
+            # ==============================================================
+            x_prev = torch.zeros(Batch, 9, device=DEVICE)
+
+            # Extract Master's Radar measurement from the first frame (meas[:, 0, 0:3])
+            # meas is normalized: [az_norm, el_norm, r_norm]
+            m_meas_0 = meas[:, 0, 0:3]
+            m_mask_0 = mask_input[:, 0, 0:3]
+
+            # Un-normalize to calculate Cartesian coordinates
+            az = m_meas_0[:, 0] * math.pi
+            el = m_meas_0[:, 1] * math.pi
+            r = m_meas_0[:, 2] * 150000.0
+
+            # Convert to Cartesian (x, y, z)
+            x_init = r * torch.cos(el) * torch.cos(az)
+            y_init = r * torch.cos(el) * torch.sin(az)
+            z_init = r * torch.sin(el)
+
+            # ... 前面 x_init 等计算保持不变 ...
+            x_prev[:, 0] = x_init / 150000.0
+            x_prev[:, 3] = y_init / 150000.0
+            x_prev[:, 6] = z_init / 150000.0
+
+            # 🌟 严禁作弊！速度严格设置为 0，逼迫网络学会“冷启动提速”
+            x_prev[:, 1] = 0.0
+            x_prev[:, 4] = 0.0
+            x_prev[:, 7] = 0.0
 
             hx = None
             optimizer.zero_grad()
             pred_states = []
 
-            for t in range(Time):
+            pred_states.append(x_prev)
+
+            for t in range(1, Time):
                 dt_t = dt[:, t]
                 meas_t = meas[:, t, :]
                 mask_t = mask_input[:, t, :]
-                base_t = baselines[:, t, :]  # 🌟 当前帧的僚机基线
+                base_t = baselines[:, t, :]
 
-                # 🌟 传入 base_t
-                x_pred, hx = model(meas_t, mask_t, dt_t, base_t, x_prev, hx)
+                # 🌟 核心修复：绝对不能在这里清空 hx！让 GRU 保持完整的序列记忆！
+                x_pred, hx, _ = model(meas_t, mask_t, dt_t, base_t, x_prev, hx, step=t)
 
                 pred_states.append(x_pred)
                 x_prev = x_pred
 
             pred_states = torch.stack(pred_states, dim=1)
+            state_mask = mask_loss.unsqueeze(2).expand(-1, -1, 9)  # 🌟 修复：扩展为 9 维
 
-            state_mask = mask_loss.unsqueeze(2).expand(-1, -1, 6)
+            time_weights = torch.ones(1, Time, 1, device=DEVICE)
 
-            gamma = 0.99
-            time_weights = (gamma ** torch.arange(Time - 1, -1, -1, device=DEVICE)).view(1, Time, 1)
-            time_weights = time_weights / time_weights.mean()
+            # 🌟 修复：使用 0,3,6 和 1,4,7 取位置和速度
+            loss_pos = criterion(pred_states[:, :, [0, 3, 6]], states[:, :, [0, 3, 6]]) * time_weights
+            loss_vel = criterion(pred_states[:, :, [1, 4, 7]], states[:, :, [1, 4, 7]]) * time_weights
 
-            loss_pos = criterion(pred_states[:, :, [0, 2, 4]], states[:, :, [0, 2, 4]]) * time_weights
-            loss_vel = criterion(pred_states[:, :, [1, 3, 5]], states[:, :, [1, 3, 5]]) * time_weights
-
-            # 🌟 核心修复 2：极度平滑的余弦相似度损失 (Cosine Similarity Loss)
+            # 计算极坐标余弦相似度损失
             pred_x = pred_states[:, :, 0]
-            pred_y = pred_states[:, :, 2]
+            pred_y = pred_states[:, :, 3]  # 🌟 y轴索引改为 3
             gt_x = states[:, :, 0]
-            gt_y = states[:, :, 2]
+            gt_y = states[:, :, 3]  # 🌟 y轴索引改为 3
 
-            # 加上 1e-8 防止除以 0
             pred_r_xy = torch.sqrt(pred_x ** 2 + pred_y ** 2 + 1e-8)
             gt_r_xy = torch.sqrt(gt_x ** 2 + gt_y ** 2 + 1e-8)
-
-            # 计算余弦相似度: (x1*x2 + y1*y2) / (r1*r2)
             cos_sim = (pred_x * gt_x + pred_y * gt_y) / (pred_r_xy * gt_r_xy)
-
-            # 余弦损失: 1 - cos(theta)。角度完全一致时为 0，相反时为 2
             loss_az = (1.0 - cos_sim) * time_weights.squeeze(-1)
-            # =======================================================
 
             # 调整权重：因为 Cosine Loss 是稳定且有上限的，我们将权重调整为合理的比例
             weight_pos = 3.0
             weight_vel = 5.0
             weight_az = 5.0  # 🌟 适当降低惩罚，让网络有喘息空间
 
-            mask_pos = state_mask[:, :, [0, 2, 4]]
-            mask_vel = state_mask[:, :, [1, 3, 5]]
+            mask_pos = state_mask[:, :, [0, 3, 6]]  # 🌟 修复索引
+            mask_vel = state_mask[:, :, [1, 4, 7]]  # 🌟 修复索引
             mask_az = mask_loss
 
             valid_count_pos = mask_pos.sum() + 1e-6
@@ -153,13 +176,17 @@ def train():
             optimizer.step()
 
             total_loss += total_loss_val.item()
+            # 🌟 提取物理误差用于监控
+            avg_pos_rmse_m += math.sqrt(loss_pos_val.item()) * 150000.0
             count_batches += 1
 
         avg_loss = total_loss / count_batches
+        avg_rmse = avg_pos_rmse_m / count_batches
         scheduler.step(avg_loss)
 
         if (epoch + 1) % 5 == 0:
-            print(f"Epoch [{epoch + 1}/{EPOCHS}], Loss: {avg_loss:.6f}")
+            # 🌟 现在你能看到真实的物理误差了，几万米就是没收敛，几百米才是成功！
+            print(f"Epoch [{epoch + 1}/{EPOCHS}], Loss: {avg_loss:.6f}, 均方误差: {avg_rmse:.1f} 米")
 
         if avg_loss < best_loss:
             best_loss = avg_loss

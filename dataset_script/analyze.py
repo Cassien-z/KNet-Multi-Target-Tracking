@@ -9,7 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D
 RAY_LEN_EO = 100000.0  # EO 方向射线长度
 RAY_LEN_ESM = 100000.0  # ESM 方向射线长度
 # 🟢 注意：这里文件名改为了刚生成的异步协同数据集
-DATA_FILE = "dataset_final_stonesoup_v1_4_asynchronous.json"
+DATA_FILE = "knet_verify_data/track_data_105.json"  # 🌟 已更新为你最新生成的文件名
 
 # =========================
 # 读取数据
@@ -26,6 +26,9 @@ except FileNotFoundError:
 # 数据容器
 # =========================
 truth_pts = []
+truth_acc = []  # 🌟 新增：用于记录目标真实加速度
+time_stamps = []
+
 # 🟢 适应多平台：使用字典按 ID 存储轨迹
 platform_pts_dict = {
     "master_0": [],
@@ -72,10 +75,16 @@ def get_body_to_world_matrix(vx, vy, vz):
 # 遍历帧
 # =========================
 for frame in dataset:
-    # 提取目标真值
+    time_stamps.append(frame["time_s"])
+
+    # 提取目标真值 (🌟 修改为 9维 索引: 0, 3, 6)
     truth = frame["ground_truth_state"]
-    Tx, Ty, Tz = truth[0], truth[2], truth[4]
+    Tx, Ty, Tz = truth[0], truth[3], truth[6]
     truth_pts.append([Tx, Ty, Tz])
+
+    # 🌟 提取真实加速度 (索引: 2, 5, 8)
+    Ax, Ay, Az = truth[2], truth[5], truth[8]
+    truth_acc.append([Ax, Ay, Az])
 
     platforms_data = frame.get("platforms", {})
 
@@ -87,8 +96,9 @@ for frame in dataset:
         if platform_state is None:
             continue
 
-        Px, Py, Pz = platform_state[0], platform_state[2], platform_state[4]
-        Pvx, Pvy, Pvz = platform_state[1], platform_state[3], platform_state[5]
+        # 🌟 修改平台物理状态索引为 9 维 (位置 0,3,6; 速度 1,4,7)
+        Px, Py, Pz = platform_state[0], platform_state[3], platform_state[6]
+        Pvx, Pvy, Pvz = platform_state[1], platform_state[4], platform_state[7]
         P_pos = np.array([Px, Py, Pz])
 
         # 记录该平台轨迹
@@ -133,50 +143,71 @@ for frame in dataset:
 # 转数组
 # =========================
 truth_pts = np.array(truth_pts)
+truth_acc = np.array(truth_acc)
+time_stamps = np.array(time_stamps)
 radar_pts = np.array(radar_pts) if len(radar_pts) > 0 else np.empty((0, 3))
 
 # =========================
 # 绘图
 # =========================
-fig = plt.figure(figsize=(15, 12))
-ax = fig.add_subplot(111, projection="3d")
+# 🌟 修改：创建一个主图(3D轨迹)和三个子图(加速度曲线)的布局
+fig = plt.figure(figsize=(18, 10))
+ax_3d = fig.add_subplot(1, 2, 1, projection="3d")  # 左侧画 3D 轨迹
 
-# 1. 真值轨迹
-ax.plot(truth_pts[:, 0], truth_pts[:, 1], truth_pts[:, 2],
-        color="black", linewidth=3, label="Target Truth")
+# --- 1. 左侧：绘制 3D 轨迹 ---
+# 真值轨迹
+ax_3d.plot(truth_pts[:, 0], truth_pts[:, 1], truth_pts[:, 2],
+           color="black", linewidth=3, label="Target Truth")
 
-# 2. 绘制各平台轨迹 (使用不同颜色区分)
+# 绘制各平台轨迹
 colors = {"master_0": "red", "wingman_1": "green", "wingman_2": "blue"}
-# 🌟 修改图例标签
 labels = {"master_0": "Master (No Delay)", "wingman_1": "Wingman 1 (Fast Link)", "wingman_2": "Wingman 2 (Fast Link)"}
 
 for p_id, pts in platform_pts_dict.items():
     if len(pts) > 0:
         pts_arr = np.array(pts)
-        ax.plot(pts_arr[:, 0], pts_arr[:, 1], pts_arr[:, 2],
-                linestyle="--", color=colors.get(p_id, "gray"), linewidth=2, label=labels.get(p_id, p_id))
+        ax_3d.plot(pts_arr[:, 0], pts_arr[:, 1], pts_arr[:, 2],
+                   linestyle="--", color=colors.get(p_id, "gray"), linewidth=2, label=labels.get(p_id, p_id))
 
-# 3. 雷达点集
-if len(radar_pts) > 0:
-    ax.scatter(radar_pts[:, 0], radar_pts[:, 1], radar_pts[:, 2],
-               s=5, c="blue", alpha=0.5, label="Radar Detections (Multi-platform)")
-
-# 4. 射线投影 (为了性能和画面清晰度，每 20 根画一根)
+# 射线投影
 stride = 20
-
 for P, d in eo_rays[::stride]:
     end = P + d * RAY_LEN_EO
-    ax.plot([P[0], end[0]], [P[1], end[1]], [P[2], end[2]],
-            color="orange", alpha=0.2, linewidth=1)
+    ax_3d.plot([P[0], end[0]], [P[1], end[1]], [P[2], end[2]],
+               color="orange", alpha=0.2, linewidth=1)
 
 for P, d in esm_rays[::stride]:
     end = P + d * RAY_LEN_ESM
-    ax.plot([P[0], end[0]], [P[1], end[1]], [P[2], end[2]],
-            color="purple", alpha=0.2, linewidth=1)
+    ax_3d.plot([P[0], end[0]], [P[1], end[1]], [P[2], end[2]],
+               color="purple", alpha=0.2, linewidth=1)
 
-ax.set_xlabel("X (m)")
-ax.set_ylabel("Y (m)")
-ax.set_zlabel("Z (m)")
-ax.set_title("Multi-Platform Cooperative Tracking Simulation\n(Master + 2 Wingmen with Fast Datalink)")
-ax.legend()
+ax_3d.set_xlabel("X (m)")
+ax_3d.set_ylabel("Y (m)")
+ax_3d.set_zlabel("Z (m)")
+ax_3d.set_title("Multi-Platform Cooperative Tracking Simulation (9D CA Model)")
+ax_3d.legend()
+
+# --- 2. 右侧：绘制目标真实加速度曲线 (🌟 新增功能) ---
+ax_ax = fig.add_subplot(3, 2, 2)
+ax_ay = fig.add_subplot(3, 2, 4)
+ax_az = fig.add_subplot(3, 2, 6)
+
+ax_ax.plot(time_stamps, truth_acc[:, 0], color="purple", label="Target True Acc_X")
+ax_ax.set_ylabel("Acc X (m/s^2)")
+ax_ax.grid(True, linestyle="--", alpha=0.5)
+ax_ax.legend(loc="upper right")
+
+ax_ay.plot(time_stamps, truth_acc[:, 1], color="orange", label="Target True Acc_Y")
+ax_ay.set_ylabel("Acc Y (m/s^2)")
+ax_ay.grid(True, linestyle="--", alpha=0.5)
+ax_ay.legend(loc="upper right")
+
+ax_az.plot(time_stamps, truth_acc[:, 2], color="teal", label="Target True Acc_Z")
+ax_az.set_ylabel("Acc Z (m/s^2)")
+ax_az.set_xlabel("Time (s)")
+ax_az.grid(True, linestyle="--", alpha=0.5)
+ax_az.legend(loc="upper right")
+
+plt.suptitle("Target Trajectory and Acceleration Profile Analysis", fontsize=16)
+plt.tight_layout()
 plt.show()

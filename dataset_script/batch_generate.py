@@ -19,4 +19,4 @@ def start_batch_work(count):
 
 
 if __name__ == "__main__":
-    start_batch_work(10)
+    start_batch_work(110)

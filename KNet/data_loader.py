@@ -5,11 +5,13 @@ import numpy as np
 import json
 import os
 
-# 🟢 统一归一化配置
-NORM_POS = 150000.0  # 150km
-NORM_VEL = 500.0  # 500m/s
-NORM_R = 150000.0  # 150km
-NORM_ANG = np.pi  # 角度除以 pi
+NORM_CFG = {
+    "pos": 150000.0,
+    "vel": 500.0,
+    "acc": 50.0,    # 🌟 新增：50m/s^2 (约5G) 为归一化基准
+    "r": 150000.0,
+    "ang": np.pi
+}
 
 
 class MultiTrackingDataset(Dataset):
@@ -34,7 +36,7 @@ class MultiTrackingDataset(Dataset):
             return meas_arr, mask_arr
 
         # 获取平台速度
-        vx, vy, vz = p_state[1], p_state[3], p_state[5]
+        vx, vy, vz = p_state[1], p_state[4], p_state[7]
         sensors = p_data.get('sensors', {})
 
         if 'sensor_0' in sensors and sensors['sensor_0']['observations']:
@@ -83,8 +85,7 @@ class MultiTrackingDataset(Dataset):
 
             # 1. 目标相对长机的状态
             gt_rel = gt_w - m_state
-            states.append([gt_rel[0], gt_rel[1], gt_rel[2], gt_rel[3], gt_rel[4], gt_rel[5]])
-
+            states.append(gt_rel)
             # 2. 僚机相对长机的基线向量 (Wingman - Master)
             base1 = wm1_state - m_state
             base2 = wm2_state - m_state
@@ -101,20 +102,23 @@ class MultiTrackingDataset(Dataset):
 
         # ========== 归一化 ==========
         norm_states = np.array(states, dtype=np.float32)
-        norm_states[:, [0, 2, 4]] /= NORM_POS
-        norm_states[:, [1, 3, 5]] /= NORM_VEL
+        # 🌟 修复：更新为 9维索引，并修复 NORM_POS 未定义问题，使用 NORM_CFG
+        norm_states[:, [0, 3, 6]] /= NORM_CFG['pos']
+        norm_states[:, [1, 4, 7]] /= NORM_CFG['vel']
+        norm_states[:, [2, 5, 8]] /= NORM_CFG['acc']
 
         # 基线向量同样需要归一化 (让网络在同一尺度下运算)
         norm_bases = np.array(baselines, dtype=np.float32)
-        norm_bases[:, [0, 2, 4, 6, 8, 10]] /= NORM_POS
-        norm_bases[:, [1, 3, 5, 7, 9, 11]] /= NORM_VEL
+        norm_bases[:, [0, 3, 6, 9, 12, 15]] /= NORM_CFG['pos']
+        norm_bases[:, [1, 4, 7, 10, 13, 16]] /= NORM_CFG['vel']
+        norm_bases[:, [2, 5, 8, 11, 14, 17]] /= NORM_CFG['acc']  # 🌟 别忘了加速度
 
         norm_meas = np.array(all_meas, dtype=np.float32)
-        # 27维中，角度索引和距离索引规律排布
         ang_idx = [0, 1, 3, 4, 6, 9, 10, 12, 13, 15, 18, 19, 21, 22, 24]
         r_idx = [2, 11, 20]
-        norm_meas[:, ang_idx] /= NORM_ANG
-        norm_meas[:, r_idx] /= NORM_R
+        # 🌟 修复 NORM_ANG 和 NORM_R 未定义
+        norm_meas[:, ang_idx] /= NORM_CFG['ang']
+        norm_meas[:, r_idx] /= NORM_CFG['r']
 
         dts = np.diff(times, prepend=times[0] if len(times) == 1 else times[1] - times[0])
         dts = np.array(dts, dtype=np.float32)
@@ -177,8 +181,9 @@ def collate_fn(batch):
     max_len = max(lengths)
     batch_size = len(batch)
 
-    padded_states = torch.zeros(batch_size, max_len, 6)
-    padded_bases = torch.zeros(batch_size, max_len, 12)
+    # 🌟 修复：states pad 的最后一维改为 9
+    padded_states = torch.zeros(batch_size, max_len, 9)
+    padded_bases = torch.zeros(batch_size, max_len, 18)
     padded_meas = torch.zeros(batch_size, max_len, 27)
     padded_mask_input = torch.zeros(batch_size, max_len, 27)
     padded_dt = torch.zeros(batch_size, max_len)
