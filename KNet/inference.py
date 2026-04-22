@@ -7,9 +7,9 @@ import os
 from knet_model import KNet_Tracker
 
 NORM_CFG = {
-    "pos": 150000.0,
+    "pos": 5000.0,   # 🌟 必须改为 5000.0
     "vel": 500.0,
-    "acc": 50.0,
+    "acc": 50.0,     # 🌟 补上加速度基准
     "r": 150000.0,
     "ang": np.pi
 }
@@ -49,16 +49,24 @@ def convert_body_to_world_meas(az_body, el_body, r_body, vx, vy, vz):
 class KNet_Engine:
     def __init__(self, weights_path):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = KNet_Tracker(num_platforms=3).to(self.device)
+        self.model = KNet_Tracker().to(self.device)
 
+        # 加载权重
         if os.path.exists(weights_path):
             self.model.load_state_dict(torch.load(weights_path, map_location=self.device))
-            print(f"✅ 成功加载多机协同权重：{weights_path}")
+            print(f"✅ 成功加载推理模型权重: {weights_path}")
         else:
-            raise FileNotFoundError(f"❌ 未找到权重文件：{weights_path}")
+            print(f"⚠️ 找不到权重文件 {weights_path}，将使用随机初始化权重！")
 
         self.model.eval()
-        self.reset()
+
+        # 🌟 修复报错：在这里初始化所有跨帧所需的变量
+        self.prev_t = None
+        self.ref_pos = None
+
+        # 🌟 初始化 RNN 的跨帧状态（极其重要）
+        self.h = None  # GRU 的隐藏层状态
+        self.curr_state_in = None  # 物理运动学模型的上一帧后验状态
 
     def reset(self):
         self.hx = None
@@ -101,100 +109,164 @@ class KNet_Engine:
 
         return meas_arr, mask_arr
 
-    def predict_step(self, platforms_dict, t):
-        self.step_count += 1
-        master = platforms_dict.get('master_0', {})
-        wm1 = platforms_dict.get('wingman_1', {})
-        wm2 = platforms_dict.get('wingman_2', {})
+    def _extract_platform_data(self, p_data, p_state):
+        """提取单个平台的 9维测量 和 9维掩码，全部转化为笛卡尔空间特征！"""
+        meas_arr = np.zeros(9, dtype=np.float32)
+        mask_arr = np.zeros(9, dtype=np.float32)
 
-        m_state = np.array(master["platform_state"])
+        if not p_data or p_state is None:
+            return meas_arr, mask_arr
+
+        vx, vy, vz = p_state[1], p_state[4], p_state[7]
+        sensors = p_data.get('sensors', {})
+
+        # 🌟 核心修改 1：雷达直接算好笛卡尔坐标 dx, dy, dz
+        if 'sensor_0' in sensors and sensors['sensor_0'].get('observations'):
+            meas = sensors['sensor_0']['observations'][0]['meas']
+            az_w, el_w, r_w = convert_body_to_world_meas(meas[0], meas[1], meas[2], vx, vy, vz)
+            dx = r_w * np.cos(el_w) * np.cos(az_w)
+            dy = r_w * np.cos(el_w) * np.sin(az_w)
+            dz = r_w * np.sin(el_w)
+            meas_arr[0:3] = [dx, dy, dz]
+            mask_arr[0:3] = [1.0, 1.0, 1.0]
+
+        # 🌟 核心修改 2：光电算好单位方向的笛卡尔射线 (放大至 NORM_CFG 以便归一化后为 1)
+        if 'sensor_1' in sensors and sensors['sensor_1'].get('observations'):
+            meas = sensors['sensor_1']['observations'][0]['meas']
+            az_w, el_w, _ = convert_body_to_world_meas(meas[0], meas[1], 1.0, vx, vy, vz)
+            r_pseudo = 5000.0  # NORM_CFG['pos'] 的值
+            dx = r_pseudo * np.cos(el_w) * np.cos(az_w)
+            dy = r_pseudo * np.cos(el_w) * np.sin(az_w)
+            dz = r_pseudo * np.sin(el_w)
+            meas_arr[3:6] = [dx, dy, dz]
+            mask_arr[3:6] = [1.0, 1.0, 0.0]
+
+        # 🌟 核心修改 3：ESM 算好 XY 平面射线
+        if 'sensor_2' in sensors and sensors['sensor_2'].get('observations'):
+            meas = sensors['sensor_2']['observations'][0]['meas']
+            az_w, _, _ = convert_body_to_world_meas(meas[0], 0.0, 1.0, vx, vy, vz)
+            r_pseudo = 5000.0
+            dx = r_pseudo * np.cos(az_w)
+            dy = r_pseudo * np.sin(az_w)
+            dz = 0.0
+            meas_arr[6:9] = [dx, dy, dz]
+            mask_arr[6:9] = [1.0, 0.0, 0.0]
+
+        return meas_arr, mask_arr
+
+    def _get_observation_vector(self, platforms):
+        """整合三个平台的观测与掩码，生成 27 维向量"""
+        master = platforms.get('master_0', {})
+        wm1 = platforms.get('wingman_1', {})
+        wm2 = platforms.get('wingman_2', {})
+
+        m_state = master.get("platform_state")
+        wm1_state = wm1.get("platform_state")
+        wm2_state = wm2.get("platform_state")
+
+        m_meas, m_mask = self._extract_platform_data(master, m_state)
+        w1_meas, w1_mask = self._extract_platform_data(wm1, wm1_state)
+        w2_meas, w2_mask = self._extract_platform_data(wm2, wm2_state)
+
+        meas_27 = np.concatenate([m_meas, w1_meas, w2_meas])
+        mask_27 = np.concatenate([m_mask, w1_mask, w2_mask])
+        return meas_27, mask_27
+
+    def _get_baseline_vector(self, platforms, m_state):
+        """计算僚机相对于长机的 18 维基线特征"""
+        wm1 = platforms.get('wingman_1', {})
+        wm2 = platforms.get('wingman_2', {})
+
         wm1_state = np.array(wm1["platform_state"]) if wm1.get("platform_state") else m_state
         wm2_state = np.array(wm2["platform_state"]) if wm2.get("platform_state") else m_state
 
-        pos_idx = [0, 3, 6] if len(m_state) == 9 else [0, 2, 4]
-        vel_idx = [1, 4, 7] if len(m_state) == 9 else [1, 3, 5]
+        base1 = wm1_state - m_state
+        base2 = wm2_state - m_state
 
-        # ==========================================
-        # 🌟 修复：两点差分高精度冷启动
-        # ==========================================
-        m_meas, _ = self._extract_platform_meas(master, m_state)
-        az, el, r = m_meas[0] * NORM_CFG['ang'], m_meas[1] * NORM_CFG['ang'], m_meas[2] * NORM_CFG['r']
-        x = r * math.cos(el) * math.cos(az)
-        y = r * math.cos(el) * math.sin(az)
-        z = r * math.sin(el)
+        return np.concatenate([base1, base2])
 
-        # ==========================================
-        # 🌟 安全冷启动：完全信任第一帧雷达，速度给 0
-        # ==========================================
-        if self.curr_state is None:
-            m_meas, _ = self._extract_platform_meas(master, m_state)
-            az, el, r = m_meas[0] * NORM_CFG['ang'], m_meas[1] * NORM_CFG['ang'], m_meas[2] * NORM_CFG['r']
-            x = r * math.cos(el) * math.cos(az)
-            y = r * math.cos(el) * math.sin(az)
-            z = r * math.sin(el)
-
-            init_rel = np.array([
-                x / NORM_CFG['pos'], 0.0, 0.0,
-                y / NORM_CFG['pos'], 0.0, 0.0,
-                z / NORM_CFG['pos'], 0.0, 0.0
-            ], dtype=np.float32)
-
-            self.curr_state = torch.tensor(init_rel).unsqueeze(0).to(self.device)
-            self.last_time = t
-
-            return np.array([
-                m_state[pos_idx[0]] + x, m_state[vel_idx[0]],
-                m_state[pos_idx[1]] + y, m_state[vel_idx[1]],
-                m_state[pos_idx[2]] + z, m_state[vel_idx[2]]
-            ])
-
-        # --- 网络正式推断 ---
-        # (保留原来正常的 dt, meas_27 构建及 model forward 逻辑)
-
-        # --- 以下是网络正式推断逻辑 (从第 2 帧开始) ---
-        dt = torch.tensor([max(0.0, t - self.last_time)], dtype=torch.float32).to(self.device)
-        self.last_time = t
-
-        m_meas, m_mask = self._extract_platform_meas(master, m_state)
-        w1_meas, w1_mask = self._extract_platform_meas(wm1, wm1_state)
-        w2_meas, w2_mask = self._extract_platform_meas(wm2, wm2_state)
-
-        meas_27 = torch.tensor(np.concatenate([m_meas, w1_meas, w2_meas])).unsqueeze(0).to(self.device)
-        mask_27 = torch.tensor(np.concatenate([m_mask, w1_mask, w2_mask])).unsqueeze(0).to(self.device)
-
-        base1 = (wm1_state - m_state)
-        base2 = (wm2_state - m_state)
-        base_np = np.concatenate([base1, base2]).astype(np.float32)
-
-        # 🌟 智能基线归一化
-        if len(m_state) == 9:
-            base_np[[0, 3, 6, 9, 12, 15]] /= NORM_CFG['pos']
-            base_np[[1, 4, 7, 10, 13, 16]] /= NORM_CFG['vel']
-            base_np[[2, 5, 8, 11, 14, 17]] /= NORM_CFG['acc']
+    def predict_step(self, platforms, t):
+        """
+        单帧推理函数
+        platforms: 当前帧从 JSON 读取的平台字典
+        t: 当前帧的时间戳 (s)
+        """
+        if self.prev_t is None:
+            dt_val = 0.1  # 第一帧默认间隔
         else:
-            base_np[[0, 2, 4, 6, 8, 10]] /= NORM_CFG['pos']
-            base_np[[1, 3, 5, 7, 9, 11]] /= NORM_CFG['vel']
+            dt_val = t - self.prev_t
+        self.prev_t = t
+        dt_tensor = torch.tensor([[dt_val]], dtype=torch.float32).to(self.device)
 
-        base_tensor = torch.tensor(base_np).unsqueeze(0).to(self.device)
+        master_data = platforms.get('master_0', {})
+        if not master_data:
+            return None
+        m_state = np.array(master_data['platform_state'])
 
+        meas_27, mask_27 = self._get_observation_vector(platforms)
+        baselines_18 = self._get_baseline_vector(platforms, m_state)
+
+        # ========== 归一化输入 ==========
+        meas_norm = meas_27.copy()
+        base_norm = baselines_18.copy()
+
+        # 🌟 修复一：将僚机观测统一到长机坐标系
+        meas_norm[9:12] += base_norm[0:3]
+        meas_norm[18:21] += base_norm[9:12]
+
+        # 🌟 修复二：减去初始参考点 ref_pos，进入局部坐标系
+        if hasattr(self, 'ref_pos') and self.ref_pos is not None:
+            for i in [0, 9, 18]: meas_norm[i] -= self.ref_pos[0]
+            for i in [1, 10, 19]: meas_norm[i] -= self.ref_pos[1]
+            for i in [2, 11, 20]: meas_norm[i] -= self.ref_pos[2]
+
+        meas_norm /= NORM_CFG['pos']
+
+        base_norm[[0, 3, 6, 9, 12, 15]] /= NORM_CFG['pos']
+        base_norm[[1, 4, 7, 10, 13, 16]] /= NORM_CFG['vel']
+        base_norm[[2, 5, 8, 11, 14, 17]] /= NORM_CFG['acc']
+
+        meas_tensor = torch.from_numpy(meas_norm).float().unsqueeze(0).unsqueeze(0).to(self.device)
+        base_tensor = torch.from_numpy(base_norm).float().unsqueeze(0).unsqueeze(0).to(self.device)
+        mask_tensor = torch.from_numpy(mask_27).float().unsqueeze(0).unsqueeze(0).to(self.device)
+
+        # ========== 模型前向推理 ==========
+        self.model.eval()
         with torch.no_grad():
-            self.curr_state, self.hx, _ = self.model(
-                meas_27, mask_27, dt, base_tensor, self.curr_state, self.hx, step=self.step_count
+
+            # 🌟 终极修复 1：安全提取历史记忆，防止张量污染
+            safe_h_in = self.h.detach().clone() if self.h is not None else None
+            safe_state_in = self.curr_state_in.detach().clone() if self.curr_state_in is not None else None
+
+            pred_states_norm, next_h, next_state = self.model(
+                meas_tensor, base_tensor, mask_tensor, dt_tensor,
+                h_in=safe_h_in, state_in=safe_state_in
             )
 
-        out_np = self.curr_state.cpu().numpy()[0]
-        pred_rel_pos = np.array([out_np[0], out_np[3], out_np[6]]) * NORM_CFG['pos']
-        pred_rel_vel = np.array([out_np[1], out_np[4], out_np[7]]) * NORM_CFG['vel']
+            # 🌟 终极修复 2：将网络的新记忆安全保存
+            self.h = next_h.detach().clone()
+            self.curr_state_in = next_state.detach().clone()
 
-        # 最终恢复绝对坐标返回
-        pred_abs_pos = m_state[pos_idx] + pred_rel_pos
-        pred_abs_vel = m_state[vel_idx] + pred_rel_vel
+            # 提取网络最新一帧预测的 9 维状态 (相对坐标)
+            curr_state_norm = pred_states_norm[0, -1, :].cpu().numpy()
 
-        return np.array([
-            pred_abs_pos[0], pred_abs_vel[0],
-            pred_abs_pos[1], pred_abs_vel[1],
-            pred_abs_pos[2], pred_abs_vel[2]
-        ])
+        # ========== 绝对坐标还原 ==========
+        final_state = curr_state_norm.copy()
+
+        # 乘回物理缩放尺度
+        final_state[[0, 3, 6]] *= NORM_CFG['pos']
+        final_state[[1, 4, 7]] *= NORM_CFG['vel']
+        final_state[[2, 5, 8]] *= NORM_CFG['acc']
+
+        # 加回初始参考点 ref_pos
+        if hasattr(self, 'ref_pos') and self.ref_pos is not None:
+            final_state[[0, 3, 6]] += self.ref_pos
+
+        # 加回长机当前帧的绝对坐标
+        final_state += m_state
+
+        # 🌟 返回 6 维 [X, Vx, Y, Vy, Z, Vz] 供脚本评估
+        return final_state[[0, 1, 3, 4, 6, 7]]
 
 
 def evaluate(json_path, weights_path):
@@ -206,6 +278,9 @@ def evaluate(json_path, weights_path):
     print(f"📊 协同评估：{json_path}")
     print(f"{'Frame':<6} | {'PosErr(m)':<10} | {'Status':<15}")
 
+    # 🌟 新增：用于记录第一帧的局部坐标系原点
+    ref_pos = None
+
     for i, frame in enumerate(data):
         t = frame['time_s']
         gt_w = np.array(frame['ground_truth_state'])
@@ -213,6 +288,22 @@ def evaluate(json_path, weights_path):
         master_state = platforms.get('master_0', {}).get('platform_state')
 
         if master_state is None: continue
+
+        # 🌟 新增：提取并初始化 ref_pos
+        if ref_pos is None:
+            # 提取真实目标的绝对初始位置 [X, Y, Z]
+            if len(gt_w) == 9:
+                gt_pos = gt_w[[0, 3, 6]]
+            else:
+                gt_pos = gt_w[[0, 2, 4]]
+
+            # 提取长机的绝对初始位置 [X, Y, Z]
+            m_pos = np.array(master_state)[[0, 3, 6]]
+
+            # 记录“目标 - 长机”的初始相对距离作为原点
+            ref_pos = gt_pos - m_pos
+            # 把原点告诉推理引擎
+            engine.ref_pos = ref_pos
 
         # 🌟 动态切片：无论 JSON 是旧的 6维还是新的 9维，都能精准切到 XYZ
         if len(gt_w) == 9:

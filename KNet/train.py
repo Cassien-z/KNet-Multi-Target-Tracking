@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from data_loader import MultiTrackingDataset, collate_fn
+from data_loader import MultiTrackingDataset, collate_fn, NORM_CFG
 from knet_model import KNet_Tracker
 import os
 import math
@@ -11,17 +11,26 @@ import math
 # ================= 配置区域 =================
 DATA_DIR = "knet_train_data"
 BATCH_SIZE = 32
-EPOCHS = 200
-LEARNING_RATE = 1e-5
-SEQ_LEN = 100  # 🌟 终极修复 2：从 600 改为 100（甚至是 50），极大降低梯度爆炸概率
+EPOCHS = 400
+LEARNING_RATE = 1e-4
+SEQ_LEN = 600
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 🟢 配置：是否微调
-DO_FINE_TUNE = True
-MODEL_PATH = "knet_weights_finetuned.pth"
-SAVE_PATH = "knet_weights_finetuned.pth" if DO_FINE_TUNE else "knet_weights.pth"
+# 🟢 配置：微调与保存
+DO_FINE_TUNE = False
+MODEL_PATH = "knet_weights.pth"
+SAVE_PATH = "knet_weights.pth"
 
+# 🟢 配置：学习率衰减机制
+LR_PATIENCE = 10      # 如果连续 10 个 Epoch Loss 都没有下降，就降低学习率
+LR_FACTOR = 0.1       # 每次触发降低时，学习率乘以 0.5
 # ===========================================
+
+# 🌟 将原来的 nn.MSELoss() 替换为：
+criterion_pos = nn.SmoothL1Loss(reduction='none')
+criterion_vel = nn.SmoothL1Loss(reduction='none')
+criterion_acc = nn.SmoothL1Loss(reduction='none')  # 🌟 必须加上这行！专门用于计算加速度误差
+criterion_az = nn.SmoothL1Loss(reduction='none')
 
 def train():
     print(f"正在使用设备：{DEVICE}")
@@ -50,148 +59,96 @@ def train():
 
     criterion = nn.MSELoss(reduction='none')
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=LR_FACTOR, patience=LR_PATIENCE, verbose=True
+    )
 
     best_loss = float('inf')
 
-    # 🌟 修复 1：移除多余的重复 epoch 循环
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0.0
-        count_batches = 0
         avg_pos_rmse_m = 0.0
+        count_batches = 0
 
-        for batch_data in loader:
-            states = batch_data['states'].to(DEVICE)
-            meas = batch_data['meas'].to(DEVICE)
-
-            if torch.isnan(states).any() or torch.isnan(meas).any():
-                print("⚠️ 警告：DataLoader 加载到了 NaN 数据，请检查 JSON 文件！")
-                continue
-
-            mask_input = batch_data['mask_input'].to(DEVICE)
-            mask_loss = batch_data['mask_loss'].to(DEVICE)
-            dt = batch_data['dt'].to(DEVICE)
-            baselines = batch_data['baselines'].to(DEVICE)
-
-            Batch, Time, _ = states.shape
-
-            # ==============================================================
-            # 🌟 FIX 1: Realistic "Cold Start" Initialization
-            # Instead of True State + Noise, use the raw Master radar measurement
-            # to initialize x_prev, exactly like inference.py does.
-            # ==============================================================
-            x_prev = torch.zeros(Batch, 9, device=DEVICE)
-
-            # Extract Master's Radar measurement from the first frame (meas[:, 0, 0:3])
-            # meas is normalized: [az_norm, el_norm, r_norm]
-            m_meas_0 = meas[:, 0, 0:3]
-            m_mask_0 = mask_input[:, 0, 0:3]
-
-            # Un-normalize to calculate Cartesian coordinates
-            az = m_meas_0[:, 0] * math.pi
-            el = m_meas_0[:, 1] * math.pi
-            r = m_meas_0[:, 2] * 150000.0
-
-            # Convert to Cartesian (x, y, z)
-            x_init = r * torch.cos(el) * torch.cos(az)
-            y_init = r * torch.cos(el) * torch.sin(az)
-            z_init = r * torch.sin(el)
-
-            # ... 前面 x_init 等计算保持不变 ...
-            x_prev[:, 0] = x_init / 150000.0
-            x_prev[:, 3] = y_init / 150000.0
-            x_prev[:, 6] = z_init / 150000.0
-
-            # 🌟 严禁作弊！速度严格设置为 0，逼迫网络学会“冷启动提速”
-            x_prev[:, 1] = 0.0
-            x_prev[:, 4] = 0.0
-            x_prev[:, 7] = 0.0
-
-            hx = None
+        for batch_idx, batch in enumerate(loader):
             optimizer.zero_grad()
-            pred_states = []
 
-            pred_states.append(x_prev)
+            # 1. 转移到 GPU/CPU
+            target_states = batch['states'].to(DEVICE)
+            baselines = batch['baselines'].to(DEVICE)
+            meas = batch['meas'].to(DEVICE)
+            mask_input = batch['mask_input'].to(DEVICE)
+            mask_loss = batch['mask_loss'].to(DEVICE)
+            dt = batch['dt'].to(DEVICE)
 
-            for t in range(1, Time):
-                dt_t = dt[:, t]
-                meas_t = meas[:, t, :]
-                mask_t = mask_input[:, t, :]
-                base_t = baselines[:, t, :]
+            # 2. 前向传播 (根据你的 KNet_Tracker 实际需要的输入传参)
+            # 这里默认传 meas, baselines, mask_input, dt
+            pred_states, _, _ = model(meas, baselines, mask_input, dt)
 
-                # 🌟 核心修复：绝对不能在这里清空 hx！让 GRU 保持完整的序列记忆！
-                x_pred, hx, _ = model(meas_t, mask_t, dt_t, base_t, x_prev, hx, step=t)
+            # 3. 生成 3D 掩码，去除 DataLoader 中由于 Padding 补零的无效数据
+            # mask_loss 原始形状 [batch_size, seq_len]，扩展为 [batch_size, seq_len, 3]
+            mask_3d = mask_loss.unsqueeze(-1).expand(-1, -1, 3)
+            valid_count = mask_3d.sum() + 1e-8  # 防止除以 0
 
-                pred_states.append(x_pred)
-                x_prev = x_pred
+            # ================= 核心修改区域：物理单位对齐 =================
+            # A. 提取位置、速度、加速度，并乘回真实的物理单位
+            pred_pos_m = pred_states[:, :, [0, 3, 6]] * NORM_CFG["pos"]
+            target_pos_m = target_states[:, :, [0, 3, 6]] * NORM_CFG["pos"]
 
-            pred_states = torch.stack(pred_states, dim=1)
-            state_mask = mask_loss.unsqueeze(2).expand(-1, -1, 9)  # 🌟 修复：扩展为 9 维
+            pred_vel_ms = pred_states[:, :, [1, 4, 7]] * NORM_CFG["vel"]
+            target_vel_ms = target_states[:, :, [1, 4, 7]] * NORM_CFG["vel"]
 
-            time_weights = torch.ones(1, Time, 1, device=DEVICE)
+            pred_acc = pred_states[:, :, [2, 5, 8]] * NORM_CFG["acc"]
+            target_acc = target_states[:, :, [2, 5, 8]] * NORM_CFG["acc"]
 
-            # 🌟 修复：使用 0,3,6 和 1,4,7 取位置和速度
-            loss_pos = criterion(pred_states[:, :, [0, 3, 6]], states[:, :, [0, 3, 6]]) * time_weights
-            loss_vel = criterion(pred_states[:, :, [1, 4, 7]], states[:, :, [1, 4, 7]]) * time_weights
+            # B. 计算基础 Loss (由于加了 reduction='none'，这里输出的是逐元素的矩阵)
+            loss_pos_raw = criterion_pos(pred_pos_m, target_pos_m)
+            loss_vel_raw = criterion_vel(pred_vel_ms, target_vel_ms)
+            loss_acc_raw = criterion_acc(pred_acc, target_acc)
 
-            # 计算极坐标余弦相似度损失
-            pred_x = pred_states[:, :, 0]
-            pred_y = pred_states[:, :, 3]  # 🌟 y轴索引改为 3
-            gt_x = states[:, :, 0]
-            gt_y = states[:, :, 3]  # 🌟 y轴索引改为 3
+            # C. 乘以掩码并求均值 (严格做到只计算有效帧的误差)
+            loss_pos_val = (loss_pos_raw * mask_3d).sum() / valid_count
+            loss_vel_val = (loss_vel_raw * mask_3d).sum() / valid_count
+            loss_acc_val = (loss_acc_raw * mask_3d).sum() / valid_count
 
-            pred_r_xy = torch.sqrt(pred_x ** 2 + pred_y ** 2 + 1e-8)
-            gt_r_xy = torch.sqrt(gt_x ** 2 + gt_y ** 2 + 1e-8)
-            cos_sim = (pred_x * gt_x + pred_y * gt_y) / (pred_r_xy * gt_r_xy)
-            loss_az = (1.0 - cos_sim) * time_weights.squeeze(-1)
+            # D. 加权汇总 (位置误差通常有几十米，而速度误差只有几米，这里通过权重配平梯度)
+            weight_pos, weight_vel, weight_acc = 2.0, 3.0, 5.0
+            total_loss_val = weight_pos * loss_pos_val + weight_vel * loss_vel_val + weight_acc * loss_acc_val
+            # =============================================================
 
-            # 调整权重：因为 Cosine Loss 是稳定且有上限的，我们将权重调整为合理的比例
-            weight_pos = 3.0
-            weight_vel = 5.0
-            weight_az = 5.0  # 🌟 适当降低惩罚，让网络有喘息空间
-
-            mask_pos = state_mask[:, :, [0, 3, 6]]  # 🌟 修复索引
-            mask_vel = state_mask[:, :, [1, 4, 7]]  # 🌟 修复索引
-            mask_az = mask_loss
-
-            valid_count_pos = mask_pos.sum() + 1e-6
-            valid_count_vel = mask_vel.sum() + 1e-6
-            valid_count_az = mask_az.sum() + 1e-6
-
-            loss_pos_val = (loss_pos * mask_pos).sum() / valid_count_pos
-            loss_vel_val = (loss_vel * mask_vel).sum() / valid_count_vel
-            loss_az_val = (loss_az * mask_az).sum() / valid_count_az
-
-            total_loss_val = weight_pos * loss_pos_val + weight_vel * loss_vel_val + weight_az * loss_az_val
-
-            # 🌟 终极修复 3：如果算出来的 Loss 已经是 NaN 了，直接抛弃这个 Batch，绝不污染模型！
+            # 4. NaN 崩溃保护
             if torch.isnan(total_loss_val) or torch.isinf(total_loss_val):
                 print(f"⚠️ 警告：当前 Batch 产生 NaN 损失，紧急跳过！")
                 optimizer.zero_grad()
                 continue
 
+            # 5. 反向传播与梯度裁剪
             total_loss_val.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+            # 6. 统计数据
             total_loss += total_loss_val.item()
-            # 🌟 提取物理误差用于监控
-            avg_pos_rmse_m += math.sqrt(loss_pos_val.item()) * 150000.0
+            # 🌟 注意：因为上面已经乘了 NORM_CFG["pos"]，这里的 loss_pos_val.item() 直接就是"米"的近似误差
+            avg_pos_rmse_m += loss_pos_val.item()
             count_batches += 1
 
-        avg_loss = total_loss / count_batches
-        avg_rmse = avg_pos_rmse_m / count_batches
+        # ====== 打印当前 Epoch 结果 ======
+        avg_loss = total_loss / count_batches if count_batches > 0 else 0
+        avg_rmse = avg_pos_rmse_m / count_batches if count_batches > 0 else 0
+
+        # 学习率调度器更新
         scheduler.step(avg_loss)
 
-        if (epoch + 1) % 5 == 0:
-            # 🌟 现在你能看到真实的物理误差了，几万米就是没收敛，几百米才是成功！
-            print(f"Epoch [{epoch + 1}/{EPOCHS}], Loss: {avg_loss:.6f}, 均方误差: {avg_rmse:.1f} 米")
+        # 每一轮打印一次，直观看到你的网络追踪精度（单位：米）
+        print(f"Epoch [{epoch + 1:>3}/{EPOCHS}] | Total Loss: {avg_loss:.2f} | 平均位置误差评估: {avg_rmse:.2f} 米")
 
+        # 默认每 10 轮保存一次模型
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(model.state_dict(), save_path)
-            print(f"💾 保存最佳模型 ({save_path}): Loss {best_loss:.6f}")
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f"  🏆 发现最佳模型！Loss 降至 {best_loss:.2f}，已保存至 {SAVE_PATH}")
 
     print(f"\n🎉 训练结束！最佳 Loss: {best_loss:.6f}")
     print(f"📂 请使用模型文件：{save_path}")

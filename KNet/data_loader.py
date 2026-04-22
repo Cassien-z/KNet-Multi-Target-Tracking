@@ -6,10 +6,10 @@ import json
 import os
 
 NORM_CFG = {
-    "pos": 150000.0,
+    "pos": 5000.0,   # 从 15万 降到 5千！
     "vel": 500.0,
-    "acc": 50.0,    # 🌟 新增：50m/s^2 (约5G) 为归一化基准
-    "r": 150000.0,
+    "acc": 50.0,
+    "r": 150000.0,   # 极坐标测距可以保留原样，因为它本身就是相对距离
     "ang": np.pi
 }
 
@@ -28,36 +28,46 @@ class MultiTrackingDataset(Dataset):
         return len(self.files)
 
     def _extract_platform_data(self, p_data, p_state):
-        """提取单个平台的 9维测量 和 9维掩码，并进行空间配准"""
+        """提取单个平台的 9维测量 和 9维掩码，全部转化为笛卡尔空间特征！"""
         meas_arr = np.zeros(9, dtype=np.float32)
         mask_arr = np.zeros(9, dtype=np.float32)
 
-        if p_data is None or p_state is None:
+        if not p_data or p_state is None:
             return meas_arr, mask_arr
 
-        # 获取平台速度
         vx, vy, vz = p_state[1], p_state[4], p_state[7]
         sensors = p_data.get('sensors', {})
 
-        if 'sensor_0' in sensors and sensors['sensor_0']['observations']:
+        # 🌟 核心修改 1：雷达直接算好笛卡尔坐标 dx, dy, dz
+        if 'sensor_0' in sensors and sensors['sensor_0'].get('observations'):
             meas = sensors['sensor_0']['observations'][0]['meas']
-            # 🌟 配准：Body -> World
             az_w, el_w, r_w = convert_body_to_world_meas(meas[0], meas[1], meas[2], vx, vy, vz)
-            meas_arr[0:3] = [az_w, el_w, r_w]
+            dx = r_w * np.cos(el_w) * np.cos(az_w)
+            dy = r_w * np.cos(el_w) * np.sin(az_w)
+            dz = r_w * np.sin(el_w)
+            meas_arr[0:3] = [dx, dy, dz]
             mask_arr[0:3] = [1.0, 1.0, 1.0]
 
-        if 'sensor_1' in sensors and sensors['sensor_1']['observations']:
+        # 🌟 核心修改 2：光电算好单位方向的笛卡尔射线 (放大至 NORM_CFG 以便归一化后为 1)
+        if 'sensor_1' in sensors and sensors['sensor_1'].get('observations'):
             meas = sensors['sensor_1']['observations'][0]['meas']
-            # 🌟 配准：缺省距离用 1.0 代替运算
             az_w, el_w, _ = convert_body_to_world_meas(meas[0], meas[1], 1.0, vx, vy, vz)
-            meas_arr[3:6] = [az_w, el_w, 0.0]
+            r_pseudo = 5000.0  # NORM_CFG['pos'] 的值
+            dx = r_pseudo * np.cos(el_w) * np.cos(az_w)
+            dy = r_pseudo * np.cos(el_w) * np.sin(az_w)
+            dz = r_pseudo * np.sin(el_w)
+            meas_arr[3:6] = [dx, dy, dz]
             mask_arr[3:6] = [1.0, 1.0, 0.0]
 
-        if 'sensor_2' in sensors and sensors['sensor_2']['observations']:
+        # 🌟 核心修改 3：ESM 算好 XY 平面射线
+        if 'sensor_2' in sensors and sensors['sensor_2'].get('observations'):
             meas = sensors['sensor_2']['observations'][0]['meas']
-            # 🌟 配准：缺省仰角 0.0，距离 1.0
             az_w, _, _ = convert_body_to_world_meas(meas[0], 0.0, 1.0, vx, vy, vz)
-            meas_arr[6:9] = [az_w, 0.0, 0.0]
+            r_pseudo = 5000.0
+            dx = r_pseudo * np.cos(az_w)
+            dy = r_pseudo * np.sin(az_w)
+            dz = 0.0
+            meas_arr[6:9] = [dx, dy, dz]
             mask_arr[6:9] = [1.0, 0.0, 0.0]
 
         return meas_arr, mask_arr
@@ -102,23 +112,38 @@ class MultiTrackingDataset(Dataset):
 
         # ========== 归一化 ==========
         norm_states = np.array(states, dtype=np.float32)
-        # 🌟 修复：更新为 9维索引，并修复 NORM_POS 未定义问题，使用 NORM_CFG
+        norm_bases = np.array(baselines, dtype=np.float32)
+        norm_meas = np.array(all_meas, dtype=np.float32)
+
+        # 🌟 修复一：将僚机的雷达观测，补偿基线偏移，统一拉回长机坐标系！
+        # 僚机1 的雷达位置 (9:12) 加上 僚机1 的相对基线 (0:3)
+        norm_meas[:, 9:12] += norm_bases[:, 0:3]
+        # 僚机2 的雷达位置 (18:21) 加上 僚机2 的相对基线 (9:12)
+        norm_meas[:, 18:21] += norm_bases[:, 9:12]
+
+        # 🌟 修复二：局部坐标系平移
+        ref_pos = norm_states[0, [0, 3, 6]].copy()
+
+        # 1. 目标真实状态减去原点
+        norm_states[:, 0] -= ref_pos[0]
+        norm_states[:, 3] -= ref_pos[1]
+        norm_states[:, 6] -= ref_pos[2]
+
+        # 2. 所有雷达观测值也必须减去 同一个原点！（确保输入输出在同一个局部空间）
+        for i in [0, 9, 18]: norm_meas[:, i] -= ref_pos[0]  # X轴
+        for i in [1, 10, 19]: norm_meas[:, i] -= ref_pos[1]  # Y轴
+        for i in [2, 11, 20]: norm_meas[:, i] -= ref_pos[2]  # Z轴
+
+        # 缩放 (除以物理极限)
         norm_states[:, [0, 3, 6]] /= NORM_CFG['pos']
         norm_states[:, [1, 4, 7]] /= NORM_CFG['vel']
         norm_states[:, [2, 5, 8]] /= NORM_CFG['acc']
 
-        # 基线向量同样需要归一化 (让网络在同一尺度下运算)
-        norm_bases = np.array(baselines, dtype=np.float32)
         norm_bases[:, [0, 3, 6, 9, 12, 15]] /= NORM_CFG['pos']
         norm_bases[:, [1, 4, 7, 10, 13, 16]] /= NORM_CFG['vel']
-        norm_bases[:, [2, 5, 8, 11, 14, 17]] /= NORM_CFG['acc']  # 🌟 别忘了加速度
+        norm_bases[:, [2, 5, 8, 11, 14, 17]] /= NORM_CFG['acc']
 
-        norm_meas = np.array(all_meas, dtype=np.float32)
-        ang_idx = [0, 1, 3, 4, 6, 9, 10, 12, 13, 15, 18, 19, 21, 22, 24]
-        r_idx = [2, 11, 20]
-        # 🌟 修复 NORM_ANG 和 NORM_R 未定义
-        norm_meas[:, ang_idx] /= NORM_CFG['ang']
-        norm_meas[:, r_idx] /= NORM_CFG['r']
+        norm_meas /= NORM_CFG['pos']
 
         dts = np.diff(times, prepend=times[0] if len(times) == 1 else times[1] - times[0])
         dts = np.array(dts, dtype=np.float32)

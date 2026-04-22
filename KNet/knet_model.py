@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import math
+# 🌟 导入归一化配置，用于物理尺度补偿
+from data_loader import NORM_CFG
 
 
 class KNet_Tracker(nn.Module):
@@ -10,17 +12,16 @@ class KNet_Tracker(nn.Module):
         self.num_platforms = num_platforms
         self.total_meas_dim = num_platforms * meas_dim_per_platform
 
+        # 特征提取与注意力机制部分 (保持你原来的设计)
         self.embed_dim = embed_dim
         self.query_proj = nn.Linear(state_dim, embed_dim)
-
         platform_feat_dim = meas_dim_per_platform * 2 + state_dim
         self.kv_proj = nn.Linear(platform_feat_dim, embed_dim)
-
         self.attention = nn.MultiheadAttention(embed_dim, num_heads=4, batch_first=True)
         self.attn_ln = nn.LayerNorm(embed_dim)
 
+        # RNN 输入维度：27维量测 + 27维掩码 + 18维基线 + embed_dim + 9维状态 + 1维dt
         input_dim = self.total_meas_dim * 2 + 18 + embed_dim + state_dim + 1
-
         self.gru = nn.GRU(input_dim, hidden_size, batch_first=True)
         self.ln = nn.LayerNorm(hidden_size)
 
@@ -28,129 +29,100 @@ class KNet_Tracker(nn.Module):
             nn.Linear(hidden_size, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, state_dim * self.total_meas_dim)
+            # 🌟 修改：直接输出 9 维的状态修正量，不再输出庞大的 K 矩阵
+            nn.Linear(256, state_dim)
         )
 
-        self.register_buffer('norm_ang', torch.tensor(math.pi))
-        self.register_buffer('norm_r', torch.tensor(150000.0))
+    def forward(self, meas, baselines, mask_input, dts, h_in=None, state_in=None):
+        """
+        meas: [B, T, 27]
+        baselines: [B, T, 18]
+        mask_input: [B, T, 27]
+        dts: [B, T]
+        """
+        batch_size, seq_len, _ = meas.shape
+        device = meas.device
 
-    def f_predict(self, x, dt):
-        B = x.shape[0]
-        if dt.dim() == 1: dt = dt.unsqueeze(-1)
+        # 如果有外部传入的历史状态，就继承它；否则从 0 开始
+        if h_in is not None:
+            h = h_in
+        else:
+            h = torch.zeros(1, batch_size, self.gru.hidden_size).to(device)
 
-        # 构建 9x9 状态转移矩阵
-        F = torch.eye(9, device=x.device).unsqueeze(0).repeat(B, 1, 1)
+        if state_in is not None:
+            curr_state = state_in
+        else:
+            curr_state = torch.zeros(batch_size, self.state_dim).to(device)
 
-        # 🌟 结合归一化系数的动力学积分 (pos/150000, vel/500, acc/50)
-        dt_pos_v = dt.squeeze(-1) * (500.0 / 150000.0)
-        dt_pos_a = 0.5 * (dt.squeeze(-1) ** 2) * (50.0 / 150000.0)
-        dt_vel_a = dt.squeeze(-1) * (50.0 / 500.0)
+        predictions = []
 
-        for i in range(3):
-            idx = i * 3  # 0, 3, 6 分别对应 x, y, z 轴的起始索引
-            F[:, idx, idx+1] = dt_pos_v    # pos = pos + vel * dt
-            F[:, idx, idx+2] = dt_pos_a    # pos = pos + 0.5 * acc * dt^2
-            F[:, idx+1, idx+2] = dt_vel_a  # vel = vel + acc * dt
+        for t in range(seq_len):
+            # --- 1. 物理预测步 (Kinematic Predict) ---
+            dt = dts[:, t].unsqueeze(-1)
+            pred_state = curr_state.clone()
 
-        return torch.bmm(F, x.unsqueeze(-1)).squeeze(-1)
+            scale_v2p = NORM_CFG['vel'] / NORM_CFG['pos']
+            scale_a2v = NORM_CFG['acc'] / NORM_CFG['vel']
 
-    def _wrap_angle(self, angle):
-        two_pi = 2.0 * math.pi
-        return angle - two_pi * torch.round(angle / two_pi)
+            pred_state[:, [0, 3, 6]] += curr_state[:, [1, 4, 7]] * dt * scale_v2p
+            pred_state[:, [1, 4, 7]] += curr_state[:, [2, 5, 8]] * dt * scale_a2v
 
-    def _get_platform_y_pred(self, x_rel):
-        y_phys = torch.zeros(x_rel.shape[0], 9, device=x_rel.device)
-        # 🌟 修复：9维状态下，y的索引是3，z的索引是6
-        r_xy = torch.sqrt(x_rel[:, 0] ** 2 + x_rel[:, 3] ** 2 + 1e-9)
-        az = torch.atan2(x_rel[:, 3], x_rel[:, 0])
-        el = torch.atan2(x_rel[:, 6], r_xy)
-        r = torch.sqrt(x_rel[:, 0] ** 2 + x_rel[:, 3] ** 2 + x_rel[:, 6] ** 2 + 1e-9)
+            # --- 2. 提取当前帧特征 (Attention) ---
+            q = self.query_proj(pred_state).unsqueeze(1)  # [B, 1, embed_dim]
 
-        az_norm = az / self.norm_ang
-        el_norm = el / self.norm_ang
+            # 🌟 终极修复：显式计算残差 (Innovation)
+            pred_pos = pred_state[:, [0, 3, 6]]  # 提取预测的三维相对位置 [B, 3]
 
-        y_phys[:, 0:3] = torch.stack([az_norm, el_norm, r], dim=-1)
-        y_phys[:, 3:6] = torch.stack([az_norm, el_norm, torch.zeros_like(r)], dim=-1)
-        y_phys[:, 6:9] = torch.stack([az_norm, torch.zeros_like(r), torch.zeros_like(r)], dim=-1)
-        return y_phys
+            meas_innov = meas[:, t, :].clone()
+            # 此时所有的 meas 都已经在上一级被统一拉到了局部的长机坐标系，所以直接减去 pred_pos 即可！
+            meas_innov[:, 0:3] = meas[:, t, 0:3] - pred_pos  # 长机残差
+            meas_innov[:, 9:12] = meas[:, t, 9:12] - pred_pos  # 僚机1残差
+            meas_innov[:, 18:21] = meas[:, t, 18:21] - pred_pos  # 僚机2残差
 
-    def forward(self, meas, mask, dt, baselines, x_prev=None, hx=None, step=100):
-        batch_size = meas.shape[0]
-        if x_prev is None:
-            x_prev = torch.zeros(batch_size, self.state_dim, device=meas.device)
+            # 分离特征，注意这里把原始的 meas 替换成了算好的残差 meas_innov
+            m_feat = torch.cat([meas_innov[:, 0:9], mask_input[:, t, 0:9], torch.zeros_like(baselines[:, t, 0:9])],
+                               dim=-1).unsqueeze(1)
+            w1_feat = torch.cat([meas_innov[:, 9:18], mask_input[:, t, 9:18], baselines[:, t, 0:9]], dim=-1).unsqueeze(
+                1)
+            w2_feat = torch.cat([meas_innov[:, 18:27], mask_input[:, t, 18:27], baselines[:, t, 9:18]],
+                                dim=-1).unsqueeze(1)
 
-        x_minus = self.f_predict(x_prev, dt)
+            # 拼接并投影 KV
+            kv_input = torch.cat([m_feat, w1_feat, w2_feat], dim=1)
+            kv = self.kv_proj(kv_input)
 
-        # ================= 预测量测计算 =================
-        # 🌟 状态升维后，位置的索引变成了 0, 3, 6
-        x_pos = x_minus[:, 0] * 150000.0
-        y_pos = x_minus[:, 3] * 150000.0
-        z_pos = x_minus[:, 6] * 150000.0
+            # 交叉注意力计算
+            attn_out, _ = self.attention(q, kv, kv)
+            attn_feat = self.attn_ln(attn_out.squeeze(1))
 
-        y_pred_m0 = self._get_platform_y_pred(x_minus)
-        y_pred_w1 = self._get_platform_y_pred(x_minus - baselines[:, 0:9])
-        y_pred_w2 = self._get_platform_y_pred(x_minus - baselines[:, 9:18])
-        y_pred = torch.cat([y_pred_m0, y_pred_w1, y_pred_w2], dim=1)
+            # --- 3. RNN 更新 ---
+            # 同样送入带残差的 meas_innov，让 GRU 直观感受到“预测到底偏了多少”
+            rnn_input = torch.cat([
+                meas_innov, mask_input[:, t, :], baselines[:, t, :],
+                attn_feat, pred_state, dt
+            ], dim=-1).unsqueeze(1)
 
-        innov = meas - y_pred
-        ang_idx = [0, 1, 3, 4, 6, 9, 10, 12, 13, 15, 18, 19, 21, 22, 24]
-        for idx in ang_idx:
-            innov[:, idx] = self._wrap_angle(innov[:, idx] * self.norm_ang.item()) / self.norm_ang.item()
-        innov = innov * mask
+            out, h = self.gru(rnn_input, h)
+            correction = self.fc(out.squeeze(1))  # [B, 9]
 
-        innov_3d = innov.view(batch_size, self.num_platforms, -1)
-        mask_3d = mask.view(batch_size, self.num_platforms, -1)
+            # --- 4. 修正步 (Update) ---
+            # 🌟 修复 Bug 1：冷启动特权门限
+            # 如果是第一帧且状态为全0，放宽限幅，让网络迅速捕捉初始速度
+            is_cold_start = (t == 0) and (torch.norm(curr_state) < 1e-5)
 
-        base_m0 = torch.zeros(batch_size, 1, self.state_dim, device=meas.device)
-        base_w1 = baselines[:, 0:9].unsqueeze(1)
-        base_w2 = baselines[:, 9:18].unsqueeze(1)
-        bases_3d = torch.cat([base_m0, base_w1, base_w2], dim=1)
+            # A. 位置限幅：冷启动允许修 5000 米，稳态只允许修 100 米
+            max_p_corr = (5000.0 if is_cold_start else 100.0) / NORM_CFG['pos']
+            correction[:, [0, 3, 6]] = torch.clamp(correction[:, [0, 3, 6]], -max_p_corr, max_p_corr)
 
-        platform_feats = torch.cat([innov_3d, mask_3d, bases_3d], dim=-1)
+            # B. 速度限幅：冷启动允许修 1000 m/s，稳态只允许修 30 m/s
+            max_v_corr = (1000.0 if is_cold_start else 30.0) / NORM_CFG['vel']
+            correction[:, [1, 4, 7]] = torch.clamp(correction[:, [1, 4, 7]], -max_v_corr, max_v_corr)
 
-        Q = self.query_proj(x_minus).unsqueeze(1)
-        KV = self.kv_proj(platform_feats)
+            # C. 加速度限幅：冷启动允许修 100 m/s²，稳态只允许修 20 m/s²
+            max_a_corr = (100.0 if is_cold_start else 20.0) / NORM_CFG['acc']
+            correction[:, [2, 5, 8]] = torch.clamp(correction[:, [2, 5, 8]], -max_a_corr, max_a_corr)
 
-        attn_out, attn_weights = self.attention(Q, KV, KV)
-        attn_out = self.attn_ln(Q + attn_out).squeeze(1)
+            curr_state = pred_state + correction
+            predictions.append(curr_state.unsqueeze(1))
 
-        dt_input = dt.unsqueeze(-1) if dt.dim() == 1 else dt
-        rnn_in = torch.cat([innov, mask, baselines, attn_out, x_minus, dt_input], dim=1).unsqueeze(1)
-
-        gru_out, hx_new = self.gru(rnn_in, hx)
-        gru_out = self.ln(gru_out)
-
-        # 5. 卡尔曼增益修正
-        # 🌟 修复：修正变量名 batch_size
-        K = self.fc(gru_out[:, -1, :]).view(batch_size, self.state_dim, self.total_meas_dim)
-
-        # ================= 终极物理保险：自适应残差门控 =================
-        # 🌟 修复：移除未定义的 self.fc_gain, innov_27 和 B，直接使用 K 和 innov 矩阵相乘
-        correction = torch.bmm(K, innov.unsqueeze(-1)).squeeze(-1)
-
-        # 🌟 智能判定：用长机雷达残差的模长来衡量目标的机动剧烈程度
-        m_innov_pos = innov_3d[:, 0, 0:3]
-        innov_mag = torch.norm(m_innov_pos, dim=-1, keepdim=True)  # [B, 1]
-
-        # 🌟 修改 1：将机动触发门限从 0.05(7500米) 降到 0.015(2250米)
-        is_high_dyn = (innov_mag > 0.015) | (step <= 10)
-
-        dynamic_gate_pos = torch.where(is_high_dyn, 0.1, 0.02)
-        # 🌟 修改 2：稳态下的速度修正限幅从 0.2 放宽到 0.4 (允许网络每帧最大改变 200m/s 的速度)
-        dynamic_gate_vel = torch.where(is_high_dyn, 1.0, 0.4)
-        dynamic_gate_acc = torch.where(is_high_dyn, 1.0, 0.2)
-
-        # 向量化安全限幅 (Clamp)
-        corr_pos = torch.max(torch.min(correction[:, [0, 3, 6]], dynamic_gate_pos), -dynamic_gate_pos)
-        corr_vel = torch.max(torch.min(correction[:, [1, 4, 7]], dynamic_gate_vel), -dynamic_gate_vel)
-        corr_acc = torch.max(torch.min(correction[:, [2, 5, 8]], dynamic_gate_acc), -dynamic_gate_acc)
-
-        correction_gated = torch.empty_like(correction)
-        correction_gated[:, [0, 3, 6]] = corr_pos
-        correction_gated[:, [1, 4, 7]] = corr_vel
-        correction_gated[:, [2, 5, 8]] = corr_acc
-
-        x_out = x_minus + correction_gated
-        return x_out, hx, attn_weights
+        return torch.cat(predictions, dim=1), h, curr_state
