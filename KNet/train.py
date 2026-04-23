@@ -91,6 +91,9 @@ def train():
             mask_3d = mask_loss.unsqueeze(-1).expand(-1, -1, 3)
             valid_count = mask_3d.sum() + 1e-8  # 防止除以 0
 
+            # 🌟 杀手锏 2：换回 MSELoss，精准打击 RMSE 指标
+            criterion_mse = nn.MSELoss(reduction='none')
+
             # ================= 核心修改区域：物理单位对齐 =================
             # A. 提取位置、速度、加速度，并乘回真实的物理单位
             pred_pos_m = pred_states[:, :, [0, 3, 6]] * NORM_CFG["pos"]
@@ -102,18 +105,27 @@ def train():
             pred_acc = pred_states[:, :, [2, 5, 8]] * NORM_CFG["acc"]
             target_acc = target_states[:, :, [2, 5, 8]] * NORM_CFG["acc"]
 
-            # B. 计算基础 Loss (由于加了 reduction='none'，这里输出的是逐元素的矩阵)
-            loss_pos_raw = criterion_pos(pred_pos_m, target_pos_m)
-            loss_vel_raw = criterion_vel(pred_vel_ms, target_vel_ms)
-            loss_acc_raw = criterion_acc(pred_acc, target_acc)
+            # B. 使用 MSE 求解误差平方
+            loss_pos_raw = criterion_mse(pred_pos_m, target_pos_m)
+            loss_vel_raw = criterion_mse(pred_vel_ms, target_vel_ms)
+            loss_acc_raw = criterion_mse(pred_acc, target_acc)
 
-            # C. 乘以掩码并求均值 (严格做到只计算有效帧的误差)
-            loss_pos_val = (loss_pos_raw * mask_3d).sum() / valid_count
-            loss_vel_val = (loss_vel_raw * mask_3d).sum() / valid_count
-            loss_acc_val = (loss_acc_raw * mask_3d).sum() / valid_count
+            # 🌟 杀手锏 1：创建时间序列渐进权重 (Burn-in 预热机制)
+            seq_length = pred_states.shape[1]
+            temporal_weights = torch.ones(seq_length, device=DEVICE)
+            warmup_len = min(50, seq_length)  # 前 50 帧作为预热期
+            # 前 50 帧的权重从 0.1 线性增长到 1.0
+            temporal_weights[:warmup_len] = torch.linspace(0.5, 1.0, steps=warmup_len, device=DEVICE)
+            # 调整形状以匹配 loss_pos_raw: [1, seq_len, 1]
+            temporal_weights = temporal_weights.unsqueeze(0).unsqueeze(-1)
 
-            # D. 加权汇总 (位置误差通常有几十米，而速度误差只有几米，这里通过权重配平梯度)
-            weight_pos, weight_vel, weight_acc = 2.0, 3.0, 5.0
+            # C. 乘以掩码、乘以时间权重并求均值 (将开局的误差降权)
+            loss_pos_val = (loss_pos_raw * mask_3d * temporal_weights).sum() / valid_count
+            loss_vel_val = (loss_vel_raw * mask_3d * temporal_weights).sum() / valid_count
+            loss_acc_val = (loss_acc_raw * mask_3d * temporal_weights).sum() / valid_count
+
+            weight_pos, weight_vel, weight_acc = 1.0, 5.0, 10.0
+
             total_loss_val = weight_pos * loss_pos_val + weight_vel * loss_vel_val + weight_acc * loss_acc_val
             # =============================================================
 
@@ -130,8 +142,8 @@ def train():
 
             # 6. 统计数据
             total_loss += total_loss_val.item()
-            # 🌟 注意：因为上面已经乘了 NORM_CFG["pos"]，这里的 loss_pos_val.item() 直接就是"米"的近似误差
-            avg_pos_rmse_m += loss_pos_val.item()
+            # 因为 loss_pos_val 是 MSE 平方误差，为了方便观察，开根号转回近似 RMSE (米)
+            avg_pos_rmse_m += math.sqrt(loss_pos_val.item())
             count_batches += 1
 
         # ====== 打印当前 Epoch 结果 ======

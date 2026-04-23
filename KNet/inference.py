@@ -318,7 +318,7 @@ def evaluate(json_path, weights_path):
         err_pos = np.linalg.norm(pred_abs_pos - gt_abs_pos)
         errors_pos.append(err_pos)
 
-        if i % 1 == 0 or i == len(data) - 1:
+        if i % 50 == 0 or i == len(data) - 1:
             status = "Coop Active" if (len(platforms) > 1) else "Single Only"
             print(f"{i:<6} | {err_pos:<10.1f} | {status}")
 
@@ -330,4 +330,4 @@ def evaluate(json_path, weights_path):
 
 if __name__ == "__main__":
     # 使用你的验证集进行测试
-    evaluate("knet_verify_data/track_data_109.json", "knet_weights_finetuned.pth")
+    evaluate("knet_verify_data/track_data_0980.json", "knet_weights.pth")

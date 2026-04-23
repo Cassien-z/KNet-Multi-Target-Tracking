@@ -25,12 +25,24 @@ class KNet_Tracker(nn.Module):
         self.gru = nn.GRU(input_dim, hidden_size, batch_first=True)
         self.ln = nn.LayerNorm(hidden_size)
 
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 256),
+        # --- 🌟 进化为神经 IMM (Neural IMM) 架构 ---
+        self.num_models = 3  # 设置 3 个隐含模型 (专家)
+
+        # 1. 专家网络群 (并行 3 个小分支，分别预测 9维 修正量)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size, 128),
+                nn.ReLU(),
+                nn.Linear(128, state_dim)
+            ) for _ in range(self.num_models)
+        ])
+
+        # 2. 门控网络 (输出当前帧这 3 个模型的概率分布，类似于 IMM 的 mode probability)
+        self.gating = nn.Sequential(
+            nn.Linear(hidden_size, 64),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            # 🌟 修改：直接输出 9 维的状态修正量，不再输出庞大的 K 矩阵
-            nn.Linear(256, state_dim)
+            nn.Linear(64, self.num_models),
+            nn.Softmax(dim=-1)  # 保证概率之和为 1
         )
 
     def forward(self, meas, baselines, mask_input, dts, h_in=None, state_in=None):
@@ -96,16 +108,26 @@ class KNet_Tracker(nn.Module):
             attn_feat = self.attn_ln(attn_out.squeeze(1))
 
             # --- 3. RNN 更新 ---
-            # 同样送入带残差的 meas_innov，让 GRU 直观感受到“预测到底偏了多少”
             rnn_input = torch.cat([
                 meas_innov, mask_input[:, t, :], baselines[:, t, :],
                 attn_feat, pred_state, dt
             ], dim=-1).unsqueeze(1)
 
             out, h = self.gru(rnn_input, h)
-            correction = self.fc(out.squeeze(1))  # [B, 9]
+            gru_feat = out.squeeze(1)  # [B, hidden_size]
 
-            # --- 4. 修正步 (Update) ---
+            # --- 🌟 神经 IMM 融合步 ---
+            # A. 计算当前时刻 3 个模型的概率分布 [B, 3]
+            mode_probs = self.gating(gru_feat)
+
+            # B. 获取 3 个专家的独立预测 [B, 3, 9]
+            expert_preds = torch.stack([expert(gru_feat) for expert in self.experts], dim=1)
+
+            # C. 概率加权求和 (等价于 IMM 的混合输出) [B, 9]
+            # mode_probs.unsqueeze(-1) 形状变为 [B, 3, 1]，利用广播机制乘以 [B, 3, 9]
+            correction = torch.sum(mode_probs.unsqueeze(-1) * expert_preds, dim=1)
+
+            # --- 4. 修正步 (Update) 保持不变 ---
             # 🌟 修复 Bug 1：冷启动特权门限
             # 如果是第一帧且状态为全0，放宽限幅，让网络迅速捕捉初始速度
             is_cold_start = (t == 0) and (torch.norm(curr_state) < 1e-5)

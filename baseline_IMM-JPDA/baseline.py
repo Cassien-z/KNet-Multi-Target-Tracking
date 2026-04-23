@@ -170,7 +170,7 @@ def evaluate_per_frame(json_file):
 if __name__ == "__main__":
     # 🌟 修改这里：填入你想要逐帧测试的具体文件路径
     # 比如这里填入你之前在 inference.py 里测试用的文件
-    test_file = "verify_data/track_data_100.json"
+    test_file = "knet_verify_data/track_data_0985.json"
 
     # 调用我们刚刚写好的逐帧评估函数
     evaluate_per_frame(test_file)

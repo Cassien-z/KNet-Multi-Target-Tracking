@@ -5,6 +5,7 @@ import json
 import traceback
 import collections
 import numpy as np
+import os
 
 # StoneSoup core
 from stonesoup.types.groundtruth import GroundTruthPath, GroundTruthState
@@ -66,8 +67,7 @@ class CSSWAccelerationModel:
         self.omega0 = omega0
         self.dt = dt
 
-        self.jump_prob = 0.005
-        self.jump_scale = 15.0
+        # 🌟 删除了 jump_prob 和 jump_scale，全权交由外层状态机控制
 
         self.z1 = np.zeros(3)
         self.z2 = np.zeros(3)
@@ -77,22 +77,26 @@ class CSSWAccelerationModel:
         self.omega0 = omega0
 
     def step(self):
-        if np.random.rand() < self.jump_prob:
-            jump = np.random.randn(3) * self.jump_scale
-            self.a_bar += jump
+        # 🌟 删除了 if np.random.rand() < self.jump_prob: 的逻辑
 
         w = np.random.randn(3) * self.sigma_a
-        dz1 = self.z2
+
+        # 1. 计算二阶变化率
         dz2 = (
                 -2 * self.alpha * self.z2
                 - (self.alpha ** 2 + self.omega0 ** 2) * self.z1
                 + w
         )
 
-        self.z1 += dz1 * self.dt
+        # 2. 半隐式欧拉法
         self.z2 += dz2 * self.dt
+        self.z1 += self.z2 * self.dt
 
-        return self.a_bar + self.z1
+        # 3. 物理过载绝对限幅 (弹簧震荡不超过 8G)
+        self.z1 = np.clip(self.z1, -80.0, 80.0)
+
+        final_acc = self.a_bar + self.z1
+        return np.clip(final_acc, -150.0, 150.0)
 
 
 class KinematicMotionModel:
@@ -250,23 +254,40 @@ SENSOR_MEASUREMENT_PERIODS = {
     2: timedelta(seconds=0.1)
 }
 
+# 🌟 改造 1：保留这套精雕细琢的实战机动参数
 MODES = [
-    {"a_bar": [-2.0, 5.0, 3.0], "omega0": 1.2},
-    {"a_bar": [-5.0, -5.0, 0.0], "omega0": 0.5},
-    {"a_bar": [2.0, 3.0, -4.0], "omega0": 2.0},
+    {"a_bar": [0.0, 0.0, 0.0], "omega0": 0.0},         # 0: 平稳飞行 (带有自动改平阻尼)
+    {"a_bar": [-15.0, 20.0, 0.0], "omega0": 1.0},      # 1: 左侧急转弯 (水平面)
+    {"a_bar": [15.0, -20.0, 0.0], "omega0": 1.0},      # 2: 右侧急转弯 (水平面)
+    {"a_bar": [0.0, 0.0, -20.0], "omega0": 0.5},       # 3: 规避俯冲 (Z轴向下)
+    {"a_bar": [0.0, 0.0, 25.0], "omega0": 0.5},        # 4: 剧烈拉起 (力度略大于俯冲)
+    {"a_bar": [25.0, 25.0, 0.0], "omega0": 4.0},       # 5: 高频蛇形穿插
 ]
 
-transition_matrix = np.array([
-    [0.98, 0.01, 0.01],
-    [0.01, 0.98, 0.01],
-    [0.01, 0.01, 0.98]
-])
+# 🌟 改造 2：基于 600 帧总长的极低频触发矩阵
+transition_matrix = np.zeros((6, 6))
+
+# 对于状态 1~5，由于我们已经有了 burst_timer 状态锁强行把它们切回 0，
+# 它们自身的转移概率其实不会被用到，但为了矩阵完整性，设为保持自身
+for i in range(1, 6):
+    transition_matrix[i][i] = 1.0
+
+# 🌟 核心：状态 0 (平飞) 的转移概率
+# 99.5% 保持平飞，0.5% 触发机动（平摊给其他 5 个动作）
+# 600帧 * 0.005 = 平均每条轨迹发生 3 次机动
+stay_prob = 0.99
+turn_prob = 0.003  # 左转 0.15%
+turn_r_prob= 0.003  # 右转 0.15%
+dive_prob = 0.0015  # 俯冲 0.05% (少俯冲，防掉高度)
+pull_prob = 0.0015   # 拉起 0.10% (多拉起，抵消俯冲)
+snake_prob= 0.001  # 蛇形 0.05% (大招，最罕见)
+
+transition_matrix[0] = [stay_prob, turn_prob, turn_r_prob, dive_prob, pull_prob, snake_prob]
 
 
 def generate_maneuvering_target(start_time, duration, dt, initial_target=None):
     steps = int(duration / dt)
     current_time = start_time
-    current_model_idx = 0
 
     if initial_target is None:
         pos_init = [100000.0, 0.0, 10000.0]
@@ -282,14 +303,48 @@ def generate_maneuvering_target(start_time, duration, dt, initial_target=None):
 
     truth = GroundTruthPath()
 
+    current_model_idx = 0
+    burst_timer = 0.0  # 🌟 新增：高机动状态锁（倒计时器）
+
     for _ in range(steps):
-        probs = transition_matrix[current_model_idx]
-        next_model_idx = np.random.choice(len(MODES), p=probs)
-        if next_model_idx != current_model_idx:
-            current_model_idx = next_model_idx
+        # 🌟 核心改造：引入带记忆的限时状态机
+        if burst_timer > 0:
+            # 1. 处于剧烈机动爆发期，倒计时衰减，不发生状态转移
+            burst_timer -= dt
+            if burst_timer <= 0:
+                # 2. 爆发结束，强制恢复到平稳飞行 (CV模型)
+                current_model_idx = 0
+        else:
+            # 3. 处于平飞或常规状态，执行正常的马尔可夫概率转移
+            probs = transition_matrix[current_model_idx]
+            next_model_idx = np.random.choice(len(MODES), p=probs)
+
+            if next_model_idx != current_model_idx:
+                current_model_idx = next_model_idx
+
+                # 4. 一旦切入高危机动，立刻上锁！(全面延长机动时间)
+                if current_model_idx in [1, 2]:
+                    # 水平急转弯加长到 3.0 ~ 6.0 秒
+                    burst_timer = np.random.uniform(3.0, 6.0)
+                elif current_model_idx in [3, 4]:
+                    # 俯冲拉起加长到 2.0 ~ 3.5 秒
+                    burst_timer = np.random.uniform(2.0, 3.5)
+                elif current_model_idx == 5:
+                    # 蛇形穿插加长到 4.0 ~ 7.0 秒
+                    burst_timer = np.random.uniform(4.0, 7.0)
+
+        # 🌟 终极修复：飞行员自动改平系统 (Auto-Leveling Trim)
+        if current_model_idx == 0:
+            # 当网络处于平飞模式时，产生一个反向加速度，慢慢抹平残留的垂直速度 (VZ)
+            # 相当于飞行员推拉杆，让飞机回到完全水平
+            damp_acc_z = -0.5 * target.vel[2]
+            damp_acc_z = np.clip(damp_acc_z, -10.0, 10.0)  # 改平过载不超过 1G
+            target.switch_mode([0.0, 0.0, damp_acc_z], omega0=0.0)
+        else:
+            # 如果是其他机动，正常应用 MODES 里的设定
             target.switch_mode(**MODES[current_model_idx])
 
-        # 🌟 修改 1：同时提取生成的加速度，并挂载到 gt_state 上
+        # 执行物理步进与状态记录
         pos, vel, acc = target.step()
         state_vec = np.array([pos[0], vel[0], pos[1], vel[1], pos[2], vel[2]])
         gt_state = GroundTruthState(state_vec, timestamp=current_time)
@@ -297,6 +352,7 @@ def generate_maneuvering_target(start_time, duration, dt, initial_target=None):
         truth.append(gt_state)
 
         current_time += timedelta(seconds=dt)
+
     return truth
 
 
@@ -406,7 +462,12 @@ def run_simulation(seed=None, initial_target=None):
                             obs_list.append({"meas": [az, el, r], "type": "true"})
 
                     if obs_list:
-                        sensor_outputs[f"sensor_{idx}"] = {"observations": obs_list}
+                        # 🌟 改造 2：电子战注入！随机致盲传感器
+                        # 设定 15% 的概率该传感器被强电磁干扰，导致本帧无数据输出（脱锁）
+                        is_jammed = np.random.rand() < 0.15
+                        if not is_jammed:
+                            sensor_outputs[f"sensor_{idx}"] = {"observations": obs_list}
+                        # 如果 is_jammed 为 True，则相当于没有看到目标，产生一个局部的 Mask 0
                     p["last_meas_time"][idx] = state.timestamp
 
             if p["is_master"]:
@@ -442,13 +503,48 @@ def run_simulation(seed=None, initial_target=None):
 
 if __name__ == "__main__":
     try:
-        data = run_simulation()
-        print("生成完成，共 {} 帧".format(len(data)))
+        num_trajectories = 1000  # 🌟 改造 3：量产 2000 条高复杂度轨迹
+        save_dir = "knet_train_data"
+        os.makedirs(save_dir, exist_ok=True)
 
-        with open("dataset_final_stonesoup_v1_4_asynchronous.json", "w") as f:
-            json.dump(data, f, indent=2)
+        print(f"🚀 开始生成 {num_trajectories} 条高机动对抗轨迹...")
 
-        print("已保存 dataset_final_stonesoup_v1_4_asynchronous.json")
+        for i in range(num_trajectories):
+            # 🌟 修复：极坐标速度生成法，确保战机初始拥有合理的空速
+            # 1. 随机生成战机的总巡航速度 (例如 250 m/s 到 400 m/s，约 0.8 ~ 1.2 马赫)
+            initial_speed = np.random.uniform(250, 400)
+
+            # 2. 随机生成一个 0 到 360 度的水平航向角 (弧度制)
+            heading_angle = np.random.uniform(0, 2 * np.pi)
+
+            # 3. 将总速度分解为 X 和 Y 轴上的分量
+            vx_init = initial_speed * np.cos(heading_angle)
+            vy_init = initial_speed * np.sin(heading_angle)
+
+            # 4. Z 轴速度保持一个较小的起伏即可，模拟战机平飞巡航
+            vz_init = np.random.uniform(-50, 50)
+
+            # 🌟 组装最终的 6 维初始状态
+            random_init_target = [
+                np.random.uniform(50000, 150000),  # X 初始位置
+                vx_init,  # X 初始速度 (由极坐标分解)
+                np.random.uniform(-50000, 50000),  # Y 初始位置
+                vy_init,  # Y 初始速度 (由极坐标分解)
+                np.random.uniform(5000, 20000),  # Z 初始高度 (5000米到2万米)
+                vz_init  # Z 初始速度
+            ]
+
+            # 使用不同的 seed 保证每次轨迹不同
+            data = run_simulation(seed=i, initial_target=random_init_target)
+
+            filename = os.path.join(save_dir, f"track_data_{i:04d}.json")
+            with open(filename, "w") as f:
+                json.dump(data, f)
+
+            if (i + 1) % 100 == 0:
+                print(f"  ✅ 已生成 {i + 1} / {num_trajectories} 条轨迹...")
+
+        print(f"🎉 全部生成完成！数据集已保存在 {save_dir}/ 目录下。")
 
     except Exception:
         traceback.print_exc()

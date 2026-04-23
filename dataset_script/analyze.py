@@ -9,7 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D
 RAY_LEN_EO = 50000.0  # EO 方向射线长度
 RAY_LEN_ESM = 50000.0  # ESM 方向射线长度
 # 🟢 注意：这里文件名改为了刚生成的异步协同数据集
-DATA_FILE = "dataset_final_stonesoup_v1_4_asynchronous.json"  # 🌟 已更新为你最新生成的文件名
+DATA_FILE = "knet_verify_data/track_data_0990.json"  # 🌟 已更新为你最新生成的文件名
 
 # =========================
 # 读取数据
@@ -170,10 +170,10 @@ for p_id, pts in platform_pts_dict.items():
                    linestyle="--", color=colors.get(p_id, "gray"), linewidth=2, label=labels.get(p_id, p_id))
 
 # ================= 这里是你要补上的代码 =================
-if len(radar_pts) > 0:
+# if len(radar_pts) > 0:
     # 画出雷达观测点云，用洋红色小圆点表示，加一点透明度防止遮挡
-    ax_3d.scatter(radar_pts[:, 0], radar_pts[:, 1], radar_pts[:, 2],
-                  color="blue", s=10, alpha=0.3, label="Radar Measurements", marker="o")
+#     ax_3d.scatter(radar_pts[:, 0], radar_pts[:, 1], radar_pts[:, 2],
+#                   color="blue", s=10, alpha=0.3, label="Radar Measurements", marker="o")
 # ========================================================
 
 # 射线投影
