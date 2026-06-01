@@ -6,6 +6,7 @@
 *.h5
 *.weights
 *.onnx
+*.mat
 # 忽略所有生成的 json 轨迹数据和原始数据集
 *.json
 !package.json

@@ -6,10 +6,10 @@ from mpl_toolkits.mplot3d import Axes3D
 # =========================
 # 参数
 # =========================
-RAY_LEN_EO = 50000.0  # EO 方向射线长度
-RAY_LEN_ESM = 50000.0  # ESM 方向射线长度
+RAY_LEN_EO = 5000.0  # EO 方向射线长度
+RAY_LEN_ESM = 5000.0  # ESM 方向射线长度
 # 🟢 注意：这里文件名改为了刚生成的异步协同数据集
-DATA_FILE = "knet_verify_data/track_data_0990.json"  # 🌟 已更新为你最新生成的文件名
+DATA_FILE = "dataset_final_stonesoup_v1_4_asynchronous.json"  # 🌟 已更新为你最新生成的文件名
 
 # =========================
 # 读取数据
@@ -176,17 +176,7 @@ for p_id, pts in platform_pts_dict.items():
 #                   color="blue", s=10, alpha=0.3, label="Radar Measurements", marker="o")
 # ========================================================
 
-# 射线投影
-stride = 20
-for P, d in eo_rays[::stride]:
-    end = P + d * RAY_LEN_EO
-    ax_3d.plot([P[0], end[0]], [P[1], end[1]], [P[2], end[2]],
-               color="orange", alpha=0.2, linewidth=1)
 
-for P, d in esm_rays[::stride]:
-    end = P + d * RAY_LEN_ESM
-    ax_3d.plot([P[0], end[0]], [P[1], end[1]], [P[2], end[2]],
-               color="purple", alpha=0.2, linewidth=1)
 
 ax_3d.set_xlabel("X (m)")
 ax_3d.set_ylabel("Y (m)")

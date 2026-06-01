@@ -18,8 +18,8 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 🟢 配置：微调与保存
 DO_FINE_TUNE = False
-MODEL_PATH = "knet_weights.pth"
-SAVE_PATH = "knet_weights.pth"
+MODEL_PATH = "knet_weights_shorter.pth"
+SAVE_PATH = "knet_weights_shorter.pth"
 
 # 🟢 配置：学习率衰减机制
 LR_PATIENCE = 10      # 如果连续 10 个 Epoch Loss 都没有下降，就降低学习率

@@ -1,10 +1,10 @@
 import json
 import os
-from script import run_simulation  # 确保 script.py 在当前目录
+from script_origin import run_simulation  # 确保 script.py 在当前目录
 
 
 def start_batch_work(count):
-    save_dir = "knet_verify_data"
+    save_dir = "knet_train_data"
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 

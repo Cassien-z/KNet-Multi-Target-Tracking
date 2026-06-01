@@ -4,13 +4,14 @@ import numpy as np
 import json
 import math
 import os
+import time  # 🌟 新增：导入高精度时间模块
 from knet_model import KNet_Tracker
 
 NORM_CFG = {
     "pos": 5000.0,   # 🌟 必须改为 5000.0
     "vel": 500.0,
     "acc": 50.0,     # 🌟 补上加速度基准
-    "r": 150000.0,
+    "r": 15000.0,
     "ang": np.pi
 }
 
@@ -275,10 +276,13 @@ def evaluate(json_path, weights_path):
         data = json.load(f)
 
     errors_pos = []
-    print(f"📊 协同评估：{json_path}")
-    print(f"{'Frame':<6} | {'PosErr(m)':<10} | {'Status':<15}")
+    inference_times = []  # 🌟 新增：用于记录每一帧的推理耗时
 
-    # 🌟 新增：用于记录第一帧的局部坐标系原点
+    print(f"📊 协同评估：{json_path}")
+    # 🌟 修改：在表头加入 Time(ms) 列
+    print(f"{'Frame':<6} | {'PosErr(m)':<10} | {'Time(ms)':<10} | {'Status':<15}")
+
+    # 用于记录第一帧的局部坐标系原点
     ref_pos = None
 
     for i, frame in enumerate(data):
@@ -289,45 +293,66 @@ def evaluate(json_path, weights_path):
 
         if master_state is None: continue
 
-        # 🌟 新增：提取并初始化 ref_pos
+        # 提取并初始化 ref_pos
         if ref_pos is None:
-            # 提取真实目标的绝对初始位置 [X, Y, Z]
             if len(gt_w) == 9:
                 gt_pos = gt_w[[0, 3, 6]]
             else:
                 gt_pos = gt_w[[0, 2, 4]]
-
-            # 提取长机的绝对初始位置 [X, Y, Z]
             m_pos = np.array(master_state)[[0, 3, 6]]
-
-            # 记录“目标 - 长机”的初始相对距离作为原点
             ref_pos = gt_pos - m_pos
-            # 把原点告诉推理引擎
             engine.ref_pos = ref_pos
 
-        # 🌟 动态切片：无论 JSON 是旧的 6维还是新的 9维，都能精准切到 XYZ
+        # 动态切片：精准切到 XYZ
         if len(gt_w) == 9:
-            gt_abs_pos = gt_w[[0, 3, 6]]  # [X, 加速度X, 速度Y...] -> 修复为直接取 0, 3, 6 提取绝对位置
+            gt_abs_pos = gt_w[[0, 3, 6]]
         else:
             gt_abs_pos = gt_w[[0, 2, 4]]
 
+        # 🌟 新增：开始高精度计时
+        start_time = time.perf_counter()
+
+        # 模型单帧推理（包含前处理、网络前向传播、后处理）
         pred_abs_state = engine.predict_step(platforms, t)
-        # 统一约定的输出始终是 6 维 [X, Vx, Y, Vy, Z, Vz]
+
+        # 🌟 新增：结束计时并转换为毫秒 (ms)
+        end_time = time.perf_counter()
+        frame_time_ms = (end_time - start_time) * 1000
+        inference_times.append(frame_time_ms)
+
         pred_abs_pos = pred_abs_state[[0, 2, 4]]
 
         err_pos = np.linalg.norm(pred_abs_pos - gt_abs_pos)
         errors_pos.append(err_pos)
 
-        if i % 50 == 0 or i == len(data) - 1:
+        # 🌟 修改：在终端打印时展示当前帧耗时
+        if i % 1 == 0 or i == len(data) - 1:
             status = "Coop Active" if (len(platforms) > 1) else "Single Only"
-            print(f"{i:<6} | {err_pos:<10.1f} | {status}")
+            print(f"{i:<6} | {err_pos:<10.1f} | {frame_time_ms:<10.2f} | {status}")
 
     rmse = np.sqrt(np.mean(np.square(errors_pos)))
-    print("\n" + "=" * 40)
-    print(f"多机协同总 RMSE: {rmse:.2f} m")
-    print("=" * 40)
 
+    # 🌟 新增：计算并打印耗时统计（排除第一帧的冷启动时间）
+    if len(inference_times) > 1:
+        valid_times = inference_times[1:]  # 抛弃首帧的初始化开销
+    else:
+        valid_times = inference_times
+
+    avg_time = np.mean(valid_times)
+    max_time = np.max(valid_times)
+    min_time = np.min(valid_times)
+    fps = 1000.0 / avg_time if avg_time > 0 else 0.0
+
+    print("\n" + "=" * 45)
+    print(f"多机协同总 RMSE: {rmse:.2f} m")
+    print("-" * 45)
+    print(f"⏱️ 耗时统计 (跳过第1帧冷启动):")
+    print(f"平均单帧推理耗时 : {avg_time:.2f} ms")
+    print(f"最大单帧推理耗时 : {max_time:.2f} ms")
+    print(f"最小单帧推理耗时 : {min_time:.2f} ms")
+    print(f"等效运行帧率(FPS) : {fps:.1f} Hz")
+    print("=" * 45)
 
 if __name__ == "__main__":
     # 使用你的验证集进行测试
-    evaluate("knet_verify_data/track_data_0980.json", "knet_weights.pth")
+    evaluate("knet_verify_data/track_data_109.json", "knet_weights_shorter.pth")

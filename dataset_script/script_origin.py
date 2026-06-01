@@ -1,4 +1,4 @@
-# script.py
+# script_origin.py
 import datetime
 from datetime import timedelta
 import json
@@ -59,15 +59,16 @@ class DatalinkNode:
 class CSSWAccelerationModel:
     """CS-SW 复合机动加速度模型"""
 
-    def __init__(self, a_bar, sigma_a=5.0, alpha=0.3, omega0=1.0, dt=0.1):
+    # 🔧 调整 1：大幅降低噪声和跳变幅度，使运动更加平滑，防止脱离视野
+    def __init__(self, a_bar, sigma_a=1.0, alpha=0.3, omega0=1.0, dt=0.1):
         self.a_bar = np.array(a_bar, dtype=float)
-        self.sigma_a = sigma_a
+        self.sigma_a = sigma_a      # 原为 5.0，现降为 1.0
         self.alpha = alpha
         self.omega0 = omega0
         self.dt = dt
 
-        self.jump_prob = 0.005
-        self.jump_scale = 15.0
+        self.jump_prob = 0.001      # 原为 0.005，降低跳变概率
+        self.jump_scale = 2.0       # 原为 15.0，大幅降低跳变烈度
 
         self.z1 = np.zeros(3)
         self.z2 = np.zeros(3)
@@ -250,10 +251,11 @@ SENSOR_MEASUREMENT_PERIODS = {
     2: timedelta(seconds=0.1)
 }
 
+# 🔧 调整 2：削弱机动烈度，特别是严格限制 Z 轴（高度）的加速度，保护 ±3° 俯仰角
 MODES = [
-    {"a_bar": [-2.0, 5.0, 3.0], "omega0": 1.2},
-    {"a_bar": [-5.0, -5.0, 0.0], "omega0": 0.5},
-    {"a_bar": [2.0, 3.0, -4.0], "omega0": 2.0},
+    {"a_bar": [1.0, 2.0, 0.2], "omega0": 0.5},   # 侧飞
+    {"a_bar": [-1.0, -2.0, -0.1], "omega0": 0.2}, # 减速反向侧飞
+    {"a_bar": [0.5, 1.0, 0.0], "omega0": 0.8},    # 弱机动
 ]
 
 transition_matrix = np.array([
@@ -269,8 +271,9 @@ def generate_maneuvering_target(start_time, duration, dt, initial_target=None):
     current_model_idx = 0
 
     if initial_target is None:
-        pos_init = [100000.0, 0.0, 10000.0]
-        vel_init = [-250.0, 30.0, 0.0]
+        # 🔧 调整 3：目标初始位置在 X 轴正前方 12km，初速严格沿 X 轴正方向
+        pos_init = [12000.0, 0.0, 10000.0]
+        vel_init = [250.0, 0.0, 0.0]
     else:
         pos_init = [initial_target[0], initial_target[2], initial_target[4]]
         vel_init = [initial_target[1], initial_target[3], initial_target[5]]
@@ -289,11 +292,10 @@ def generate_maneuvering_target(start_time, duration, dt, initial_target=None):
             current_model_idx = next_model_idx
             target.switch_mode(**MODES[current_model_idx])
 
-        # 🌟 修改 1：同时提取生成的加速度，并挂载到 gt_state 上
         pos, vel, acc = target.step()
         state_vec = np.array([pos[0], vel[0], pos[1], vel[1], pos[2], vel[2]])
         gt_state = GroundTruthState(state_vec, timestamp=current_time)
-        gt_state.true_acc = acc.copy()  # 挂载属性
+        gt_state.true_acc = acc.copy()
         truth.append(gt_state)
 
         current_time += timedelta(seconds=dt)
@@ -301,7 +303,7 @@ def generate_maneuvering_target(start_time, duration, dt, initial_target=None):
 
 
 def create_sensor_platform(start_time):
-    # (此部分保持原状，它只用于初始化传感器结构，内部仍使用6维)
+    # 保持原有的传感器视野配置不动
     platform_motion = ManeuveringTarget3D(
         init_pos=[0.0, 0.0, 10000.0], init_vel=[250.0, 0.0, 0.0],
         init_a_bar=[0.0, 0.0, 0.0], dt=DT, omega0=0.0
@@ -342,11 +344,12 @@ def run_simulation(seed=None, initial_target=None):
 
     truth = generate_maneuvering_target(START_TIME, DURATION, DT, initial_target)
 
+    # 🔧 调整 4：将长机和僚机部署在原点及两侧，构建距离目标 10-15km 的跟踪阵型
     master_motion = GuidedPlatformModel(init_pos=[0.0, 0.0, 10000.0], init_vel=[250.0, 0.0, 0.0], dt=DT, gain=2.5,
                                         max_acc=40.0)
-    wm1_motion = GuidedPlatformModel(init_pos=[0.0, 10000.0, 10000.0], init_vel=[250.0, 0.0, 0.0], dt=DT, gain=2.5,
+    wm1_motion = GuidedPlatformModel(init_pos=[0.0, 6000.0, 10000.0], init_vel=[250.0, 0.0, 0.0], dt=DT, gain=2.5,
                                      max_acc=40.0)
-    wm2_motion = GuidedPlatformModel(init_pos=[-5000.0, -10000.0, 10000.0], init_vel=[250.0, 0.0, 0.0], dt=DT, gain=2.5,
+    wm2_motion = GuidedPlatformModel(init_pos=[0.0, -6000.0, 10000.0], init_vel=[250.0, 0.0, 0.0], dt=DT, gain=2.5,
                                      max_acc=40.0)
 
     platforms_info = [
@@ -364,7 +367,6 @@ def run_simulation(seed=None, initial_target=None):
     for state in truth:
         current_time_s = float((state.timestamp - START_TIME).total_seconds())
 
-        # 🌟 修改 2：提取目标位置、速度，并获取挂载的物理加速度，组装为9维
         target_pos = [state.state_vector[0], state.state_vector[2], state.state_vector[4]]
         target_vel = [state.state_vector[1], state.state_vector[3], state.state_vector[5]]
         target_acc = getattr(state, 'true_acc', np.array([0.0, 0.0, 0.0]))
@@ -378,16 +380,13 @@ def run_simulation(seed=None, initial_target=None):
         frame_platforms_data = {}
 
         for p in platforms_info:
-            # 🌟 修改 3：获取平台运动反馈的真实加速度 p_acc
             p_pos, p_vel, p_acc = p["motion"].step(target_pos)
 
-            # (供给 StoneSoup 传感器计算视野用的，依然维持标准的 6维 state)
             new_p_state = GroundTruthState(
                 [p_pos[0], p_vel[0], p_pos[1], p_vel[1], p_pos[2], p_vel[2]],
                 timestamp=state.timestamp
             )
 
-            # 🌟 修改 4：平台对外输出到 JSON / 数据链的状态采用 9 维
             p_state_9d = [
                 float(p_pos[0]), float(p_vel[0]), float(p_acc[0]),
                 float(p_pos[1]), float(p_vel[1]), float(p_acc[1]),
@@ -412,13 +411,13 @@ def run_simulation(seed=None, initial_target=None):
             if p["is_master"]:
                 frame_platforms_data[p["id"]] = {
                     "data_age": 0.0,
-                    "platform_state": p_state_9d,  # 发送 9维
+                    "platform_state": p_state_9d,
                     "sensors": sensor_outputs
                 }
             else:
                 p["datalink"].ingest_data(
                     current_time_s,
-                    p_state_9d,  # 压入 9维
+                    p_state_9d,
                     sensor_outputs
                 )
                 arrived_data = p["datalink"].get_arrived_data(current_time_s)
@@ -430,7 +429,6 @@ def run_simulation(seed=None, initial_target=None):
                 else:
                     frame_platforms_data[p["id"]] = {"data_age": -1.0, "platform_state": None, "sensors": {}}
 
-        # 🌟 修改 5：存储时直接保存 9 维的目标 GT
         dataset.append({
             "time_s": current_time_s,
             "ground_truth_state": gt_9d,

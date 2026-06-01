@@ -4,15 +4,47 @@ import numpy as np
 import json
 import math
 import os
+import time  # 🌟 新增：导入高精度时间模块
 from knet_model import KNet_Tracker
 
-# 🟢 必须与 data_loader.py 和 knet_model.py 严格一致
 NORM_CFG = {
-    "pos": 150000.0,  # 150km
-    "vel": 500.0,  # 500m/s
-    "r": 150000.0,  # 150km
-    "ang": np.pi  # 角度除以 pi
+    "pos": 5000.0,   # 🌟 必须改为 5000.0
+    "vel": 500.0,
+    "acc": 50.0,     # 🌟 补上加速度基准
+    "r": 15000.0,
+    "ang": np.pi
 }
+
+
+def convert_body_to_world_meas(az_body, el_body, r_body, vx, vy, vz):
+    r_calc = r_body if r_body > 0 else 1.0
+    vec_body = np.array([
+        r_calc * np.cos(el_body) * np.cos(az_body),
+        r_calc * np.cos(el_body) * np.sin(az_body),
+        r_calc * np.sin(el_body)
+    ])
+
+    v = np.array([vx, vy, vz])
+    speed = np.linalg.norm(v)
+    if speed < 1e-6:
+        R_b2w = np.eye(3)
+    else:
+        unit_x = v / speed
+        unit_y = np.cross([0, 0, 1], unit_x)
+        if np.linalg.norm(unit_y) < 1e-6:
+            unit_y = np.array([0, 1, 0])
+        else:
+            unit_y /= np.linalg.norm(unit_y)
+        unit_z = np.cross(unit_x, unit_y)
+        R_b2w = np.column_stack((unit_x, unit_y, unit_z))
+
+    vec_world = R_b2w @ vec_body
+
+    r_xy = np.sqrt(vec_world[0] ** 2 + vec_world[1] ** 2)
+    az_world = np.arctan2(vec_world[1], vec_world[0])
+    el_world = np.arctan2(vec_world[2], r_xy)
+
+    return az_world, el_world, r_body
 
 
 class KNet_Engine:
@@ -20,170 +52,307 @@ class KNet_Engine:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = KNet_Tracker().to(self.device)
 
+        # 加载权重
         if os.path.exists(weights_path):
             self.model.load_state_dict(torch.load(weights_path, map_location=self.device))
-            print(f"✅ 成功加载权重：{weights_path}")
+            print(f"✅ 成功加载推理模型权重: {weights_path}")
         else:
-            raise FileNotFoundError(f"❌ 未找到权重文件：{weights_path}")
+            print(f"⚠️ 找不到权重文件 {weights_path}，将使用随机初始化权重！")
 
         self.model.eval()
 
-        # 统一状态重置
-        self.reset()
+        # 🌟 修复报错：在这里初始化所有跨帧所需的变量
+        self.prev_t = None
+        self.ref_pos = None
+
+        # 🌟 初始化 RNN 的跨帧状态（极其重要）
+        self.h = None  # GRU 的隐藏层状态
+        self.curr_state_in = None  # 物理运动学模型的上一帧后验状态
 
     def reset(self):
-        """重置引擎状态（建议外部每次开始新序列时调用此方法）"""
-        self.hx = None
-        self.curr_state = None
-        self.last_time = None
-        # 🌟 新增：用于两点法差分初始化的缓存
-        self.first_pos = None
-        self.first_time = None
+        self.h = None
+        self.curr_state_in = None
+        self.prev_t = None
+        self.ref_pos = None
 
-    def _sph2cart(self, meas_sph):
-        """极坐标转直角坐标辅助函数"""
-        az, el, r = meas_sph[0], meas_sph[1], meas_sph[2]
-        x = r * math.cos(el) * math.cos(az)
-        y = r * math.cos(el) * math.sin(az)
-        z = r * math.sin(el)
-        return np.array([x, y, z])
+    def _extract_platform_meas(self, p_data, p_state):
+        meas_arr = np.zeros(9, dtype=np.float32)
+        mask_arr = np.zeros(9, dtype=np.float32)
 
-    def predict_step(self, sensors_dict, t):
-        """单步推理
-        sensors_dict: frame['sensors']
+        if not p_data or p_state is None:
+            return meas_arr, mask_arr
+
+        # 🌟 智能兼容 6维或9维的飞机自身状态提取
+        if len(p_state) == 9:
+            vx, vy, vz = p_state[1], p_state[4], p_state[7]
+        else:
+            vx, vy, vz = p_state[1], p_state[3], p_state[5]
+
+        sensors = p_data.get('sensors', {})
+
+        if 'sensor_0' in sensors and sensors['sensor_0']['observations']:
+            m = sensors['sensor_0']['observations'][0]['meas']
+            az_w, el_w, r_w = convert_body_to_world_meas(m[0], m[1], m[2], vx, vy, vz)
+            meas_arr[0:3] = [az_w / NORM_CFG['ang'], el_w / NORM_CFG['ang'], r_w / NORM_CFG['r']]
+            mask_arr[0:3] = 1.0
+
+        if 'sensor_1' in sensors and sensors['sensor_1']['observations']:
+            m = sensors['sensor_1']['observations'][0]['meas']
+            az_w, el_w, _ = convert_body_to_world_meas(m[0], m[1], 1.0, vx, vy, vz)
+            meas_arr[3:6] = [az_w / NORM_CFG['ang'], el_w / NORM_CFG['ang'], 0.0]
+            mask_arr[3:5] = 1.0
+
+        if 'sensor_2' in sensors and sensors['sensor_2']['observations']:
+            m = sensors['sensor_2']['observations'][0]['meas']
+            az_w, _, _ = convert_body_to_world_meas(m[0], 0.0, 1.0, vx, vy, vz)
+            meas_arr[6:9] = [az_w / NORM_CFG['ang'], 0.0, 0.0]
+            mask_arr[6] = 1.0
+
+        return meas_arr, mask_arr
+
+    def _extract_platform_data(self, p_data, p_state):
+        """提取单个平台的 9维测量 和 9维掩码，全部转化为笛卡尔空间特征！"""
+        meas_arr = np.zeros(9, dtype=np.float32)
+        mask_arr = np.zeros(9, dtype=np.float32)
+
+        if not p_data or p_state is None:
+            return meas_arr, mask_arr
+
+        vx, vy, vz = p_state[1], p_state[4], p_state[7]
+        sensors = p_data.get('sensors', {})
+
+        # 🌟 核心修改 1：雷达直接算好笛卡尔坐标 dx, dy, dz
+        if 'sensor_0' in sensors and sensors['sensor_0'].get('observations'):
+            meas = sensors['sensor_0']['observations'][0]['meas']
+            az_w, el_w, r_w = convert_body_to_world_meas(meas[0], meas[1], meas[2], vx, vy, vz)
+            dx = r_w * np.cos(el_w) * np.cos(az_w)
+            dy = r_w * np.cos(el_w) * np.sin(az_w)
+            dz = r_w * np.sin(el_w)
+            meas_arr[0:3] = [dx, dy, dz]
+            mask_arr[0:3] = [1.0, 1.0, 1.0]
+
+        # 🌟 核心修改 2：光电算好单位方向的笛卡尔射线 (放大至 NORM_CFG 以便归一化后为 1)
+        if 'sensor_1' in sensors and sensors['sensor_1'].get('observations'):
+            meas = sensors['sensor_1']['observations'][0]['meas']
+            az_w, el_w, _ = convert_body_to_world_meas(meas[0], meas[1], 1.0, vx, vy, vz)
+            r_pseudo = 5000.0  # NORM_CFG['pos'] 的值
+            dx = r_pseudo * np.cos(el_w) * np.cos(az_w)
+            dy = r_pseudo * np.cos(el_w) * np.sin(az_w)
+            dz = r_pseudo * np.sin(el_w)
+            meas_arr[3:6] = [dx, dy, dz]
+            mask_arr[3:6] = [1.0, 1.0, 0.0]
+
+        # 🌟 核心修改 3：ESM 算好 XY 平面射线
+        if 'sensor_2' in sensors and sensors['sensor_2'].get('observations'):
+            meas = sensors['sensor_2']['observations'][0]['meas']
+            az_w, _, _ = convert_body_to_world_meas(meas[0], 0.0, 1.0, vx, vy, vz)
+            r_pseudo = 5000.0
+            dx = r_pseudo * np.cos(az_w)
+            dy = r_pseudo * np.sin(az_w)
+            dz = 0.0
+            meas_arr[6:9] = [dx, dy, dz]
+            mask_arr[6:9] = [1.0, 0.0, 0.0]
+
+        return meas_arr, mask_arr
+
+    def _get_observation_vector(self, platforms):
+        """整合三个平台的观测与掩码，生成 27 维向量"""
+        master = platforms.get('master_0', {})
+        wm1 = platforms.get('wingman_1', {})
+        wm2 = platforms.get('wingman_2', {})
+
+        m_state = master.get("platform_state")
+        wm1_state = wm1.get("platform_state")
+        wm2_state = wm2.get("platform_state")
+
+        m_meas, m_mask = self._extract_platform_data(master, m_state)
+        w1_meas, w1_mask = self._extract_platform_data(wm1, wm1_state)
+        w2_meas, w2_mask = self._extract_platform_data(wm2, wm2_state)
+
+        meas_27 = np.concatenate([m_meas, w1_meas, w2_meas])
+        mask_27 = np.concatenate([m_mask, w1_mask, w2_mask])
+        return meas_27, mask_27
+
+    def _get_baseline_vector(self, platforms, m_state):
+        """计算僚机相对于长机的 18 维基线特征"""
+        wm1 = platforms.get('wingman_1', {})
+        wm2 = platforms.get('wingman_2', {})
+
+        wm1_state = np.array(wm1["platform_state"]) if wm1.get("platform_state") else m_state
+        wm2_state = np.array(wm2["platform_state"]) if wm2.get("platform_state") else m_state
+
+        base1 = wm1_state - m_state
+        base2 = wm2_state - m_state
+
+        return np.concatenate([base1, base2])
+
+    def predict_step(self, platforms, t):
         """
-        # 构建 9维 meas 和 9维 mask
-        frame_meas = np.zeros(9, dtype=np.float32)
-        frame_mask = np.zeros(9, dtype=np.float32)
+        单帧推理函数
+        platforms: 当前帧从 JSON 读取的平台字典
+        t: 当前帧的时间戳 (s)
+        """
+        if self.prev_t is None:
+            dt_val = 0.1  # 第一帧默认间隔
+        else:
+            dt_val = t - self.prev_t
+        self.prev_t = t
+        dt_tensor = torch.tensor([[dt_val]], dtype=torch.float32).to(self.device)
 
-        if 'sensor_0' in sensors_dict and sensors_dict['sensor_0']['observations']:
-            meas = sensors_dict['sensor_0']['observations'][0]['meas']
-            frame_meas[0:3] = meas
-            frame_mask[0:3] = [1.0, 1.0, 1.0]
+        master_data = platforms.get('master_0', {})
+        if not master_data:
+            return None
+        m_state = np.array(master_data['platform_state'])
 
-        if 'sensor_1' in sensors_dict and sensors_dict['sensor_1']['observations']:
-            meas = sensors_dict['sensor_1']['observations'][0]['meas']
-            frame_meas[3:6] = [meas[0], meas[1], 0.0]
-            frame_mask[3:6] = [1.0, 1.0, 0.0]
+        meas_27, mask_27 = self._get_observation_vector(platforms)
+        baselines_18 = self._get_baseline_vector(platforms, m_state)
 
-        if 'sensor_2' in sensors_dict and sensors_dict['sensor_2']['observations']:
-            meas = sensors_dict['sensor_2']['observations'][0]['meas']
-            frame_meas[6:9] = [meas[0], 0.0, 0.0]
-            frame_mask[6:9] = [1.0, 0.0, 0.0]
+        # ========== 归一化输入 ==========
+        meas_norm = meas_27.copy()
+        base_norm = baselines_18.copy()
 
-            # --- 零速度安全初始化逻辑 ---
-        if self.curr_state is None:
-            # 初始化必须依赖至少有方位角和距离的传感器，默认用雷达数据起步
-            az, el, r = frame_meas[0], frame_meas[1], frame_meas[2]
-            x = r * math.cos(el) * math.cos(az)
-            y = r * math.cos(el) * math.sin(az)
-            z = r * math.sin(el)
+        # 🌟 修复一：将僚机观测统一到长机坐标系
+        meas_norm[9:12] += base_norm[0:3]
+        meas_norm[18:21] += base_norm[9:12]
 
-            state = np.array([x, 0.0, y, 0.0, z, 0.0])
+        # 🌟 修复二：减去初始参考点 ref_pos，进入局部坐标系
+        if hasattr(self, 'ref_pos') and self.ref_pos is not None:
+            for i in [0, 9, 18]: meas_norm[i] -= self.ref_pos[0]
+            for i in [1, 10, 19]: meas_norm[i] -= self.ref_pos[1]
+            for i in [2, 11, 20]: meas_norm[i] -= self.ref_pos[2]
 
-            norm_state = state.copy()
-            norm_state[[0, 2, 4]] /= NORM_CFG['pos']
-            norm_state[[1, 3, 5]] /= NORM_CFG['vel']
+        meas_norm /= NORM_CFG['pos']
 
-            self.curr_state = torch.tensor(norm_state, dtype=torch.float32).unsqueeze(0).to(self.device)
-            self.last_time = t
-            return self.curr_state.detach().cpu().numpy()[0]
+        base_norm[[0, 3, 6, 9, 12, 15]] /= NORM_CFG['pos']
+        base_norm[[1, 4, 7, 10, 13, 16]] /= NORM_CFG['vel']
+        base_norm[[2, 5, 8, 11, 14, 17]] /= NORM_CFG['acc']
 
-        # --- 正常推理阶段 ---
-        dt_val = t - self.last_time
-        if dt_val < 0: dt_val = 0.0
-        dt = torch.tensor([dt_val], dtype=torch.float32).to(self.device)
+        meas_tensor = torch.from_numpy(meas_norm).float().unsqueeze(0).unsqueeze(0).to(self.device)
+        base_tensor = torch.from_numpy(base_norm).float().unsqueeze(0).unsqueeze(0).to(self.device)
+        mask_tensor = torch.from_numpy(mask_27).float().unsqueeze(0).unsqueeze(0).to(self.device)
 
-        # 对 9 维数据归一化
-        norm_meas = frame_meas.copy()
-        norm_meas[[0, 1, 3, 4, 6]] /= NORM_CFG['ang']
-        norm_meas[2] /= NORM_CFG['r']
-
-        norm_meas_t = torch.tensor(norm_meas, dtype=torch.float32).unsqueeze(0).to(self.device)
-        mask_t = torch.tensor(frame_mask, dtype=torch.float32).unsqueeze(0).to(self.device)
-
+        # ========== 模型前向推理 ==========
+        self.model.eval()
         with torch.no_grad():
-            self.curr_state, self.hx = self.model(
-                norm_meas_t, mask_t, dt, self.curr_state, self.hx
+
+            # 🌟 终极修复 1：安全提取历史记忆，防止张量污染
+            safe_h_in = self.h.detach().clone() if self.h is not None else None
+            safe_state_in = self.curr_state_in.detach().clone() if self.curr_state_in is not None else None
+
+            pred_states_norm, next_h, next_state = self.model(
+                meas_tensor, base_tensor, mask_tensor, dt_tensor,
+                h_in=safe_h_in, state_in=safe_state_in
             )
 
-        self.last_time = t
-        return self.curr_state.detach().cpu().numpy()[0]
+            # 🌟 终极修复 2：将网络的新记忆安全保存
+            self.h = next_h.detach().clone()
+            self.curr_state_in = next_state.detach().clone()
+
+            # 提取网络最新一帧预测的 9 维状态 (相对坐标)
+            curr_state_norm = pred_states_norm[0, -1, :].cpu().numpy()
+
+        # ========== 绝对坐标还原 ==========
+        final_state = curr_state_norm.copy()
+
+        # 乘回物理缩放尺度
+        final_state[[0, 3, 6]] *= NORM_CFG['pos']
+        final_state[[1, 4, 7]] *= NORM_CFG['vel']
+        final_state[[2, 5, 8]] *= NORM_CFG['acc']
+
+        # 加回初始参考点 ref_pos
+        if hasattr(self, 'ref_pos') and self.ref_pos is not None:
+            final_state[[0, 3, 6]] += self.ref_pos
+
+        # 加回长机当前帧的绝对坐标
+        final_state += m_state
+
+        # 🌟 返回 6 维 [X, Vx, Y, Vy, Z, Vz] 供脚本评估
+        return final_state[[0, 1, 3, 4, 6, 7]]
 
 
 def evaluate(json_path, weights_path):
     engine = KNet_Engine(weights_path)
-
     with open(json_path, 'r') as f:
         data = json.load(f)
 
     errors_pos = []
-    errors_range = []
-    errors_az = []
+    inference_times = []  # 🌟 新增：用于记录每一帧的推理耗时
 
-    start_time = data[0]['time_s'] if data else 0
+    print(f"📊 协同评估：{json_path}")
+    # 🌟 修改：在表头加入 Time(ms) 列
+    print(f"{'Frame':<6} | {'PosErr(m)':<10} | {'Time(ms)':<10} | {'Status':<15}")
 
-    print(f"📊 开始评估：{json_path}")
-    print(f"{'Frame':<6} | {'Time':<6} | {'PosErr(m)':<10} | {'RangeErr(m)':<10} | {'AzErr(deg)':<10}")
+    # 用于记录第一帧的局部坐标系原点
+    ref_pos = None
 
     for i, frame in enumerate(data):
         t = frame['time_s']
-
-        # 真值
         gt_w = np.array(frame['ground_truth_state'])
-        p_w = np.array(frame['platform_state'])
-        gt_rel = gt_w[[0, 2, 4]] - p_w[[0, 2, 4]]
+        platforms = frame.get('platforms', {})
+        master_state = platforms.get('master_0', {}).get('platform_state')
 
-        true_r = np.linalg.norm(gt_rel)
-        true_az = math.atan2(gt_rel[1], gt_rel[0])
-        true_el = math.asin(gt_rel[2] / (true_r + 1e-6))
+        if master_state is None: continue
 
-        # ---------- 修复前：----------
-        # obs = frame['sensors']['sensor_0']['observations']
-        # if not obs: continue
-        # meas_sph = obs[0]['meas']  # [az, el, r] (弧度，米)
-        # pred_norm = engine.predict_step(meas_sph, t)
+        # 提取并初始化 ref_pos
+        if ref_pos is None:
+            if len(gt_w) == 9:
+                gt_pos = gt_w[[0, 3, 6]]
+            else:
+                gt_pos = gt_w[[0, 2, 4]]
+            m_pos = np.array(master_state)[[0, 3, 6]]
+            ref_pos = gt_pos - m_pos
+            engine.ref_pos = ref_pos
 
-        # ========== 修复后：==========
-        # 将整个传感器字典提取出来，支持多模态解析
-        sensors_dict = frame.get('sensors', {})
+        # 动态切片：精准切到 XYZ
+        if len(gt_w) == 9:
+            gt_abs_pos = gt_w[[0, 3, 6]]
+        else:
+            gt_abs_pos = gt_w[[0, 2, 4]]
 
-        # 必须确保至少有雷达数据来起步
-        if 'sensor_0' not in sensors_dict or not sensors_dict['sensor_0']['observations']:
-            continue
+        # 🌟 新增：开始高精度计时
+        start_time = time.perf_counter()
 
-        # 预测：把整个字典喂给 KNet_Engine
-        pred_norm = engine.predict_step(sensors_dict, t)
-        pred_pos = pred_norm[[0, 2, 4]] * NORM_CFG['pos']
+        # 模型单帧推理（包含前处理、网络前向传播、后处理）
+        pred_abs_state = engine.predict_step(platforms, t)
 
-        # 误差
-        err_pos = np.linalg.norm(pred_pos - gt_rel)
-        pred_r = np.linalg.norm(pred_pos)
-        err_range = abs(pred_r - true_r)
+        # 🌟 新增：结束计时并转换为毫秒 (ms)
+        end_time = time.perf_counter()
+        frame_time_ms = (end_time - start_time) * 1000
+        inference_times.append(frame_time_ms)
 
-        pred_az = math.atan2(pred_pos[1], pred_pos[0])
-        diff_az = true_az - pred_az
-        while diff_az > np.pi: diff_az -= 2 * np.pi
-        while diff_az < -np.pi: diff_az += 2 * np.pi
-        err_az = abs(diff_az) * 180.0 / np.pi
+        pred_abs_pos = pred_abs_state[[0, 2, 4]]
 
+        err_pos = np.linalg.norm(pred_abs_pos - gt_abs_pos)
         errors_pos.append(err_pos)
-        errors_range.append(err_range)
-        errors_az.append(err_az)
 
-        if i % 50 == 0 or i < 5 or i > len(data) - 5:
-            print(f"{i:<6} | {t:<6.1f} | {err_pos:<10.1f} | {err_range:<10.1f} | {err_az:<10.4f}")
+        # 🌟 修改：在终端打印时展示当前帧耗时
+        if i % 1 == 0 or i == len(data) - 1:
+            status = "Coop Active" if (len(platforms) > 1) else "Single Only"
+            print(f"{i:<6} | {err_pos:<10.1f} | {frame_time_ms:<10.2f} | {status}")
 
-    rmse_pos = np.sqrt(np.mean(np.square(errors_pos)))
-    steady_errors = errors_pos[int(len(errors_pos) * 0.1):]  # 去掉前10%
-    rmse_steady = np.sqrt(np.mean(np.square(steady_errors))) if steady_errors else 0
+    rmse = np.sqrt(np.mean(np.square(errors_pos)))
 
-    print("\n" + "=" * 50)
-    print(f"总 RMSE: {rmse_pos:.2f} m")
-    print(f"稳态 RMSE (>10%): {rmse_steady:.2f} m")
-    print(f"平均角度误差: {np.mean(errors_az):.4f} °")
-    print("=" * 50)
+    # 🌟 新增：计算并打印耗时统计（排除第一帧的冷启动时间）
+    if len(inference_times) > 1:
+        valid_times = inference_times[1:]  # 抛弃首帧的初始化开销
+    else:
+        valid_times = inference_times
 
+    avg_time = np.mean(valid_times)
+    max_time = np.max(valid_times)
+    min_time = np.min(valid_times)
+    fps = 1000.0 / avg_time if avg_time > 0 else 0.0
+
+    print("\n" + "=" * 45)
+    print(f"多机协同总 RMSE: {rmse:.2f} m")
+    print("-" * 45)
+    print(f"⏱️ 耗时统计 (跳过第1帧冷启动):")
+    print(f"平均单帧推理耗时 : {avg_time:.2f} ms")
+    print(f"最大单帧推理耗时 : {max_time:.2f} ms")
+    print(f"最小单帧推理耗时 : {min_time:.2f} ms")
+    print(f"等效运行帧率(FPS) : {fps:.1f} Hz")
+    print("=" * 45)
 
 if __name__ == "__main__":
-    evaluate("knet_verify_data/track_data_008.json", "knet_weights_finetuned.pth")
+    # 使用你的验证集进行测试
+    evaluate("knet_verify_data/track_data_109.json", "knet_weights_shorter.pth")

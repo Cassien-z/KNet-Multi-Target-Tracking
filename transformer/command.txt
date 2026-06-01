@@ -1,0 +1,11 @@
+python train_new_new.py --epochs 100 --resume_path results\run_20260516_145209\best_model.pt
+
+
+快速迭代查看模型合理性
+python train_new_new.py --data_dir ./debug_data --batch_size 2 --epochs 50 --no-auto_best_phase2
+
+平时正式训练：你给的这句就足够了，模型参数很合理。
+python train_new_new.py --epochs 40 --d_model 96 --batch_size 4
+
+改了代码后快速测试能不能跑通：减小数据量，跳过画图和测速。
+python train_new_new.py --epochs 2 --batch_size 2 --eval_max_batches 5 --skip_plots --skip_latency
