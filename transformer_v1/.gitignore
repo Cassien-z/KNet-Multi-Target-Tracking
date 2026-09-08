@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.idea/
+tracking_system/frontend/node_modules/
+tracking_system/frontend/dist/
