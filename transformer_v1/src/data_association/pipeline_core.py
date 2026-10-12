@@ -77,15 +77,36 @@ def _radar_world(measurements, valid, position, velocity):
     return world
 
 
-def _align_stream(raw, raw_valid, t_grid):
+def _measurement_time(uav, sensor_name, local_id, fallback):
+    """Return the source timestamp carried by a sensor packet when available."""
+    value = uav.get(sensor_name, {}).get("MeasTime", fallback)
+    values = np.asarray(value, dtype=float).reshape(-1)
+    if values.size == 0:
+        return float(fallback)
+    index = min(max(int(local_id), 0), values.size - 1)
+    timestamp = float(values[index])
+    return timestamp if np.isfinite(timestamp) and timestamp >= 0.0 else float(fallback)
+
+
+def _align_stream(raw, raw_valid, t_grid, raw_times=None):
     valid_ids = np.flatnonzero(raw_valid)
     if len(valid_ids) < 2:
         aligned = np.full_like(raw, np.nan, dtype=float)
         aligned[raw_valid] = raw[raw_valid]
         return aligned, raw_valid.copy()
-    active = np.zeros(len(t_grid), dtype=bool)
-    active[valid_ids[0]:valid_ids[-1] + 1] = True
-    return time_align_interp(t_grid[raw_valid], raw[raw_valid], t_grid, active, max_interp_gap=0.45)
+    measurement_times = t_grid[raw_valid]
+    if raw_times is not None:
+        candidate = np.asarray(raw_times, dtype=float)[raw_valid]
+        finite = np.isfinite(candidate)
+        measurement_times = np.where(finite, candidate, measurement_times)
+    active = (t_grid >= np.min(measurement_times)) & (t_grid <= np.max(measurement_times))
+    return time_align_interp(
+        measurement_times,
+        raw[raw_valid],
+        t_grid,
+        active,
+        max_interp_gap=0.45,
+    )
 
 
 def _remove_radar_outliers(aligned, valid):
@@ -206,7 +227,11 @@ def process_file(mat_file_path, out_file_path, verbose=True):
     if track_count == 0:
         raise ValueError("No reference-platform radar tracks were found")
     streams = {
-        sensor: [[{"Meas": np.full((frame_count, dim), np.nan), "valid": np.zeros(frame_count, dtype=bool)} for _ in range(num_uavs)] for _ in range(track_count)]
+        sensor: [[{
+            "Meas": np.full((frame_count, dim), np.nan),
+            "valid": np.zeros(frame_count, dtype=bool),
+            "time": np.full(frame_count, np.nan),
+        } for _ in range(num_uavs)] for _ in range(track_count)]
         for sensor, dim in SENSOR_DIMS.items()
     }
     events = []
@@ -234,17 +259,29 @@ def process_file(mat_file_path, out_file_path, verbose=True):
                     continue
                 streams["Radar"][track_id][uav_id]["Meas"][frame_id] = radar[local_radar_id]
                 streams["Radar"][track_id][uav_id]["valid"][frame_id] = True
-                events.append(("Radar", uav_id, local_radar_id, track_id, t_grid[frame_id]))
+                radar_time = _measurement_time(
+                    frame["UAV"][uav_id], "Radar", local_radar_id, t_grid[frame_id]
+                )
+                streams["Radar"][track_id][uav_id]["time"][frame_id] = radar_time
+                events.append(("Radar", uav_id, local_radar_id, track_id, radar_time))
                 eo_id = eo_map.get(local_radar_id)
                 if eo_id is not None and eo_id < len(eo_valid) and eo_valid[eo_id]:
                     streams["EO"][track_id][uav_id]["Meas"][frame_id] = eo[eo_id]
                     streams["EO"][track_id][uav_id]["valid"][frame_id] = True
-                    events.append(("EO", uav_id, eo_id, track_id, t_grid[frame_id]))
+                    eo_time = _measurement_time(
+                        frame["UAV"][uav_id], "EO", eo_id, t_grid[frame_id]
+                    )
+                    streams["EO"][track_id][uav_id]["time"][frame_id] = eo_time
+                    events.append(("EO", uav_id, eo_id, track_id, eo_time))
                 esm_id = esm_map.get(local_radar_id)
                 if esm_id is not None and esm_id < len(esm_valid) and esm_valid[esm_id]:
                     streams["ESM"][track_id][uav_id]["Meas"][frame_id] = esm[esm_id]
                     streams["ESM"][track_id][uav_id]["valid"][frame_id] = True
-                    events.append(("ESM", uav_id, esm_id, track_id, t_grid[frame_id]))
+                    esm_time = _measurement_time(
+                        frame["UAV"][uav_id], "ESM", esm_id, t_grid[frame_id]
+                    )
+                    streams["ESM"][track_id][uav_id]["time"][frame_id] = esm_time
+                    events.append(("ESM", uav_id, esm_id, track_id, esm_time))
 
     registered_tracks = []
     for track_id in range(track_count):
@@ -257,7 +294,8 @@ def process_file(mat_file_path, out_file_path, verbose=True):
             for uav_id in range(num_uavs):
                 raw = streams[sensor][track_id][uav_id]["Meas"]
                 raw_valid = streams[sensor][track_id][uav_id]["valid"]
-                aligned, valid = _align_stream(raw, raw_valid, t_grid)
+                raw_times = streams[sensor][track_id][uav_id]["time"]
+                aligned, valid = _align_stream(raw, raw_valid, t_grid, raw_times)
                 if sensor == "Radar":
                     aligned, valid = _remove_radar_outliers(aligned, valid)
                     stored = aligned[:, [2, 0, 1]]

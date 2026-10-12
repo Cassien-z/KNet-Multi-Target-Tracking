@@ -23,8 +23,13 @@ for index = 1:numel(names)
     end
     % Binary files use C row-major order. Reverse dimensions before reshape,
     % then reverse axes to recover the ONNX logical shape in MATLAB.
-    value = reshape(values, fliplr(shape));
-    if numel(shape) > 1
+    % MATLAB reshape requires at least two dimensions, whereas ONNX permits
+    % rank-1 tensors such as dt with shape [1]. Keep rank-1 data as a column
+    % vector; run_tracker passes the single element to the ONNX input.
+    if numel(shape) == 1
+        value = reshape(values, shape(1), 1);
+    else
+        value = reshape(values, fliplr(shape));
         value = permute(value, numel(shape):-1:1);
     end
     data.(name) = value;

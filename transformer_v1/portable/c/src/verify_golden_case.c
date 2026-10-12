@@ -53,13 +53,22 @@ int main(int argc, char **argv) {
     TensorFile expected_spec = {"prediction", TRACKER_OUTPUT_COUNT};
     size_t index;
     int return_code = 1;
+    int repetitions = 1;
+    int repetition;
     double max_abs_error = 0.0;
     double max_position_delta = 0.0;
     double max_velocity_error = 0.0;
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: verify_golden_case MODEL.onnx GOLDEN_CASE_DIR\n");
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "Usage: verify_golden_case MODEL.onnx GOLDEN_CASE_DIR [REPETITIONS]\n");
         return 2;
+    }
+    if (argc == 4) {
+        repetitions = atoi(argv[3]);
+        if (repetitions < 1) {
+            fprintf(stderr, "REPETITIONS must be at least 1\n");
+            return 2;
+        }
     }
     for (index = 0; index < 18; ++index) {
         if (load_tensor(argv[2], &INPUT_FILES[index], &input[index])) goto cleanup;
@@ -83,29 +92,32 @@ int main(int argc, char **argv) {
 #else
     tracker = tracker_create(argv[1]);
 #endif
-    if (tracker == NULL || tracker_run(tracker, &inputs, prediction)) {
-        fprintf(stderr, "Inference failed: %s\n", tracker_last_error(tracker));
-        goto cleanup;
+    if (tracker == NULL) goto cleanup;
+    for (repetition = 0; repetition < repetitions; ++repetition) {
+        if (tracker_run(tracker, &inputs, prediction)) {
+            fprintf(stderr, "Inference failed on repetition %d: %s\n", repetition + 1, tracker_last_error(tracker));
+            goto cleanup;
+        }
+        for (index = 0; index < TRACKER_OUTPUT_COUNT; ++index) {
+            double error = fabs((double)prediction[index] - expected[index]);
+            if (error > max_abs_error) max_abs_error = error;
+        }
+        for (index = 0; index < TRACKER_SEQUENCE_LENGTH; ++index) {
+            size_t offset = index * TRACKER_STATE_DIM;
+            double dx = (double)prediction[offset] - expected[offset];
+            double dy = (double)prediction[offset + 2] - expected[offset + 2];
+            double dz = (double)prediction[offset + 4] - expected[offset + 4];
+            double position_delta = sqrt(dx * dx + dy * dy + dz * dz);
+            double velocity_error_1 = fabs((double)prediction[offset + 1] - expected[offset + 1]);
+            double velocity_error_2 = fabs((double)prediction[offset + 3] - expected[offset + 3]);
+            double velocity_error_3 = fabs((double)prediction[offset + 5] - expected[offset + 5]);
+            if (position_delta > max_position_delta) max_position_delta = position_delta;
+            if (velocity_error_1 > max_velocity_error) max_velocity_error = velocity_error_1;
+            if (velocity_error_2 > max_velocity_error) max_velocity_error = velocity_error_2;
+            if (velocity_error_3 > max_velocity_error) max_velocity_error = velocity_error_3;
+        }
     }
-
-    for (index = 0; index < TRACKER_OUTPUT_COUNT; ++index) {
-        double error = fabs((double)prediction[index] - expected[index]);
-        if (error > max_abs_error) max_abs_error = error;
-    }
-    for (index = 0; index < TRACKER_SEQUENCE_LENGTH; ++index) {
-        size_t offset = index * TRACKER_STATE_DIM;
-        double dx = (double)prediction[offset] - expected[offset];
-        double dy = (double)prediction[offset + 2] - expected[offset + 2];
-        double dz = (double)prediction[offset + 4] - expected[offset + 4];
-        double position_delta = sqrt(dx * dx + dy * dy + dz * dz);
-        double velocity_error_1 = fabs((double)prediction[offset + 1] - expected[offset + 1]);
-        double velocity_error_2 = fabs((double)prediction[offset + 3] - expected[offset + 3]);
-        double velocity_error_3 = fabs((double)prediction[offset + 5] - expected[offset + 5]);
-        if (position_delta > max_position_delta) max_position_delta = position_delta;
-        if (velocity_error_1 > max_velocity_error) max_velocity_error = velocity_error_1;
-        if (velocity_error_2 > max_velocity_error) max_velocity_error = velocity_error_2;
-        if (velocity_error_3 > max_velocity_error) max_velocity_error = velocity_error_3;
-    }
+    printf("repetitions=%d\n", repetitions);
     printf("max_abs_error=%.9g\n", max_abs_error);
     printf("max_position_delta_m=%.9g\n", max_position_delta);
     printf("max_velocity_abs_error=%.9g\n", max_velocity_error);

@@ -1,0 +1,297 @@
+Web 部分问题
+整理日期：2026-10-12
+
+一、范围与阅读说明
+
+本文件记录截至目前对 Web 推理、模型管理、批量测试、性能评估、报告中心及交付包的梳理结果。本次只整理问题，没有修改业务代码、模型权重、数据集、历史评测证据或交付 ZIP。
+
+项目根目录：D:/workstation/End-to-End-Tracking-System/transformer_v1
+当前 Web 代码：tracking_system/，不是相邻目录 Tracking_System/ 中的其他系统。
+技术结构：Vue 3 + TypeScript + ECharts/ECharts GL 前端，FastAPI + PyTorch 后端；Web 直接使用 CoopTrackerModel。MATLAB/C/ONNX 相关交付路径需单独核对，不能由 Web 功能正常推定其已验收。
+涉及页面：系统概览、模型管理、跟踪验证、批量测试、性能评估、报告中心。
+下文代码路径均相对于上述项目根目录，行号对应本次整理时的源码。
+
+证据标记：
+【已实测】前面梳理过程中通过实际模型加载、小规模推理、临时夹具或归档检查验证过。
+【代码确认】可以从当前实现确定的行为；不等于已经做过浏览器操作验证。
+【待验证/待统一】存在条件差异或要求解释，尚不能直接断言结果错误或违反协议。
+
+优先级：
+P0：优先处理，关系到正式达标判定、比较有效性或交付复现。
+P1：影响操作、显示、统计或证据追溯，应在交付前处理。
+P2：能力边界、覆盖范围或口径说明，应补足文档并按最终使用需求决定是否改造。
+
+注意：下列问题不代表所有历史评测失效，也不代表项目已被判定违约。历史 RMSE、当前样本结果、当前源码重注册结果和正式验收结果必须分别说明。模型使用未来帧、坐标处理、传感器编码与 GAT 等问题，详见《模型问题.md》；本文件重点记录 Web 如何使用、评估和导出这些结果。
+
+二、验收判定与独立评测
+
+W01【P0｜已实测、代码确认】缺少独立单帧时延证据，也可能显示“全部通过”
+代码依据：tracking_system/backend/evaluation.py:381、388、392、442。
+当前行为：有合格的 forward latency 独立证据时，时延指标采用 T=1 输入前向耗时的 P95；证据文件不存在时，却回退到批量报告的 measured_frame_ms 或 estimated_frame_ms。formal_evidence_complete 只检查关联率与基线改善率证据，没有检查时延证据是否被接受。
+验证：临时构造关联率、改善率证据均被接受而没有独立时延文件的任务，能够得到 overall_status=passed、formal_evidence_complete=true，同时 latency evidence accepted=false。未修改历史证据。
+影响：批量吞吐折算可替代独立单帧测试参与正式通过判定，证据完整性与页面结论不一致。
+建议：正式判定必须要求独立 T=1 时延证据被接受；折算耗时保留为参考。现有但无效的时延证据已经会阻止回退，缺失证据也应按正式证据未齐处理。
+
+W02【P0｜已实测、代码确认】手填基线优先于独立证据，却保留“正式证据齐备”
+代码依据：tracking_system/backend/evaluation.py:400、408、442。
+当前行为：baseline_rmse_m 手工参数优先参与改善率计算；即使已有合格的独立基线证据，也会被手填值覆盖。但 formal_evidence_complete 仍沿用原独立证据的 accepted 状态。
+验证：临时夹具中，模型 RMSE=7 m、正式基线 RMSE=8 m 时改善率为 12.5%，该项不通过；传入手填基线 10 m 后改善率变为 30%，可以显示全部通过且正式证据齐备。
+影响：复核值与正式验收值混用，可能改变验收结论。
+建议：正式结论只使用绑定任务的独立证据；手填值作为明确标识的复核结果，不能继承正式证据状态。至少应拒绝手填覆盖，或将正式状态降为证据未齐。
+
+W03【P0｜已实测、代码确认】V8 基线与模型输入时间轴不一致
+代码依据：scripts/evaluation/test_rmse_improvement.py:283、291、294。
+当前行为：IMM-JPDA 基线直接读取原始 MAT 的前 min(sequence_length, 原始帧数) 帧，滤波器 dt 固定为 0.1 s。
+数据检查：track_data_highfi_0000.mat 的 GlobalTime 开头为 0、0.025、0.05、0.075、0.1 s，共 400 帧；其前 100 帧覆盖 0～2.475 s。供当前模型使用的兼容 PKL 为 100 帧、间隔 0.1 s，覆盖 0～9.9 s。
+影响：同样写“100 帧、排除前 5 帧”，基线和模型实际评估的是不同时间范围；基线滤波步长也不匹配原始采样周期。任务签名一致不能消除这种差异。
+建议：基线与模型对齐相同物理时间网格、目标集合、有效点与 warmup 范围，并采用匹配的 dt；对齐前不把 V8 改善率作为已完成公平比较的证据。
+
+W04【P0｜已实测、代码确认】关联率证据与模型输入可能来自不同预处理链
+代码依据：scripts/evaluation/test_association_accuracy.py:106 及其后关联统计、缺失统计重算逻辑；tracking_system/backend/evaluation.py:190。
+当前行为：关联率脚本寻找对应原始 MAT，优先读取已有 AssociationStats；统计缺失时，在临时目录通过当前处理代码重新关联与注册，不覆盖历史 PKL。
+已有发现：历史 PKL 缺少 AssociationStats；当前源码重注册得到的雷达、EO、ESM、快链路数组与历史 PKL 存在差异。
+影响：模型可能在历史 PKL 上测 RMSE，关联率却来自当前源码重跑的处理结果。两者即使绑定同一任务、同名 MAT，也不能直接说明属于完全相同的一次数据处理链。
+建议：冻结原始 MAT、处理代码、参数、处理结果和 AssociationStats；让模型与关联率使用同一批注册产物。若重建整条流程，应重新跑模型指标并生成对应的新证据。
+
+W05【P0｜代码确认，公平性待统一】IMM-JPDA 与模型的比较条件未充分对齐
+代码依据：scripts/evaluation/test_rmse_improvement.py:233、276、294、389；tracking_system/backend/evaluation.py:408。
+当前基线：主要使用长机原始雷达和僚机原始快链路；不等同于模型使用的多平台雷达、EO、ESM 与注册后链路组合；以首帧真值状态初始化，固定 dt=0.1 s。模型还具有完整序列上下文。
+影响：当前改善率混合了观测信息、初始化、时间上下文、预处理链和算法本身的差异。不能仅凭证据文件 valid_for_assessment=true 就认为这些条件已经对齐，也不能简单认定某一方一定占优。
+建议：先定义正式比较条件，明确允许的传感器、链路、时间信息、初始化、有效点及 warmup；必要时补充匹配输入的基线或消融实验。报告中保留当前差异说明。
+
+W06【P1｜代码确认，要求边界待统一】代码使用 RMSE≤8 m，需要与最终验收文字统一
+代码依据：tracking_system/backend/evaluation.py:22 及 _criterion 的比较逻辑。
+当前门限：位置 RMSE≤8 m、关联准确率≥85%、RMSE 改善率≥15%、推理耗时≤100 ms。
+影响：如果最终协议要求严格“小于 8 m”，恰好等于 8 m 时当前代码仍会判通过。warmup、三维距离、总体聚合范围、时延统计方式也必须随门限一并明确。
+建议：以最终确认的协议和验收细则统一比较符号与统计口径。本条只指出实现边界，不直接作合同合规结论。
+
+三、模型管理与运行状态
+
+W07【P1｜已实测、代码确认】更新磁盘权重后，刷新或重复激活不会自动加载新权重
+代码依据：tracking_system/backend/model_manager.py:102、209、219、224。
+当前行为：相同 model_id 和 device 已激活时返回 changed=false；刷新模型目录也不重新创建当前引擎。推理继续使用内存中的权重与缓存。
+验证：已验证相同模型重复激活跳过加载、刷新前后引擎对象保持不变。
+影响：覆盖同一路径的 best_model.pt 后，页面信息与实际内存模型可能不同步，容易把旧模型结果理解为新模型结果。
+建议：模型使用不可变版本与权重哈希；提供显式重载，并在状态中展示当前内存权重身份。评测时冻结所用权重，而不只记录路径。
+
+W08【P1｜代码确认，浏览器操作待验】当前激活模型无法在界面中直接切换设备
+代码依据：tracking_system/frontend/src/views/ModelManagementView.vue:134；tracking_system/backend/model_manager.py:209。
+当前行为：部署按钮在 model.active 时禁用，但后端实际上支持同一模型切换到不同 device。
+影响：无法直接把当前模型从 CPU 切换到 CUDA，或从 CUDA 切换回 CPU；需先切到其他模型再切回，操作路径不完整。
+建议：区分“已激活同一模型、同一设备”和“同一模型需要切换设备”，允许后者提交；实际 CUDA 路径还需在具备设备的环境中验证。
+
+W09【P1｜代码确认】模型卡片展示历史指标，容易被当成当前测试结论
+代码依据：tracking_system/backend/model_manager.py:23、113。
+当前行为：卡片读取指定历史运行的 metrics_summary.json，优先采用 metrics_wo_warmup；名称、运行记录和部分训练信息来自固定目录映射，不是对当前选择的数据重新评测。
+已核对的历史去 warmup RMSE：V5 约 10.8061 m，V6 约 8.2141 m，V7 约 7.4882 m；V7 全帧 RMSE 约 7.6030 m。这些数值对应各自历史记录，不能自动视为当前 Web 任务的结果。
+影响：历史指标与当前权重、数据、代码或任务范围未明确绑定时，可能造成达标与模型优劣误读；卡片时延也不应当作独立 T=1 证据。
+建议：标注“历史评测”，同时显示运行 ID、数据/权重身份、warmup 和统计口径；当前任务结果单独展示。
+
+四、单场景推理与回放
+
+W10【P1｜代码确认】同路径 PKL 更新后，单场景缓存不会失效
+代码依据：tracking_system/backend/runtime.py:224、226、267。
+当前行为：缓存键只有文件路径与 target_index，没有文件修改时间或内容哈希。
+影响：服务运行中替换同名 PKL，再查看相同目标，仍可能获得旧预测与旧真值序列。
+建议：使用不可变数据版本或内容身份作为缓存键；增加明确的缓存清理/重新计算入口。
+
+W11【P1｜代码确认】回放 RMSE 与批量验收 RMSE 不是同一统计范围
+代码依据：tracking_system/backend/server.py:438、446、454；tracking_system/backend/batch_testing.py:115、558、629。
+当前行为：回放累计 errors_since_reset 计算运行 RMSE，拖动/重置后重新积累；不采用批量测试的前 5 帧排除逻辑。批量报告统计全部选定目标的有效位置点。
+影响：同一文件在回放中看到的 RMSE 随播放位置、重置操作而变，不能直接与批量稳定阶段 RMSE 或模型历史卡片对照。
+建议：区分“本次回放累计 RMSE”“单轨迹全段 RMSE”“批量稳定阶段全局 RMSE”，展示有效点数与起止范围。
+
+五、批量任务、取样与覆盖
+
+W12【P1｜代码确认，浏览器操作待验】自动刷新会覆盖用户在批量表单中选择的模型
+代码依据：tracking_system/frontend/src/views/BatchTestingView.vue:54；tracking_system/frontend/src/App.vue:96。
+当前行为：props.data 更新时，只要不在 submitting 状态，就把 form.model_id 设为当前激活模型；上层页面每 30 秒刷新一次。
+影响：用户准备提交另一个模型的批量任务时，已选模型可能被自动改回当前激活模型，最终评测对象与原意不符。
+建议：只在首次初始化或用户选择已失效时设置默认模型；用户修改后保留表单状态。
+
+W13【P1｜代码确认】“已评估场景数”可能包含未实际产生目标样本的文件
+代码依据：tracking_system/backend/batch_testing.py:180、485、636。
+当前行为：selected_file_count 等于选中的文件数；索引时部分读取错误会跳过，零目标文件也不产生样本；最终 evaluated_scenarios 仍写选中文件数。
+影响：报告可能高估实际完成的场景覆盖，且缺少跳过文件与原因清单。
+建议：分别记录选中文件、成功读取文件、实际产生评测点的场景、目标数、有效点数和排除原因。正式测试应对异常文件给出明确失败或排除策略。
+
+W14【P2｜代码确认】分层取样是确定性选取，不能视为随机代表样本
+代码依据：tracking_system/backend/scenario_catalog.py:200；tracking_system/backend/batch_testing.py:384。
+当前行为：按场景类型分组、组内文件名排序并轮询选取，倾向较小编号文件。V7 选 10 个时分布为 CA 3、CSSW 3、CT 2、CV 2；协同场景视图选 10 个时为 CA 5、CV 5。
+影响：适合可复现的快速检查，但单次样本不能代表完整数据集的精度与鲁棒性。
+建议：报告标记当前策略、完整文件清单与样本规模；正式指标采用确认的完整测试集，或定义带种子、可复核的抽样方案。
+
+W15【P2｜已检查数据目录】强机动/干扰场景的独立覆盖量有限，数据入口存在别名
+代码依据：tracking_system/backend/scenario_catalog.py 的数据集定义。
+当前目录规模：V5/V6/V7 各 2000 个 PKL；scenario_cooperative 是 V7 的 CA/CV 子集，共 1000 个；scenario_maneuver_jamming 与 v8_interference 指向同一个 V8_10Hz 目录，仅 1 个 PKL。
+影响：界面上多个入口并不对应多个独立数据集；一个场景中的多个目标或时间点，也不能当成多个独立场景。单文件结果的泛化证明能力有限，但不能仅据此认定违反协议。
+建议：说明别名、子集关系与独立场景数；按正式场景覆盖要求决定是否补充测试数据。
+
+六、耗时统计与运行身份
+
+W16【P1｜已实测、代码确认】“单帧耗时”混用了多种不同指标
+代码依据：tracking_system/backend/runtime.py:265；tracking_system/backend/batch_testing.py:610、645；tracking_system/backend/evaluation.py:381；tracking_system/frontend/src/views/PerformanceEvaluationView.vue:205。
+当前至少存在四种口径：
+1. 回放 per_frame_inference_ms：一次完整序列前向耗时除以该轨迹有效真值帧数。
+2. 批量 measured_frame_ms：取首条轨迹，3 次预热、10 次 T=100 前向计时，序列平均耗时除以 100；P95 同样是序列耗时 P95 除以 100。
+3. 批量 estimated_frame_ms：批量累计推理耗时除以评测有效点数。
+4. 独立 forward latency：T=1 输入多次前向的 P95，证据合格时才是正式判定所用值。
+问题：性能页“单帧实测”仍显示批量折算值，而验收指标可能使用独立 T=1 P95；其他页面又可能显示 estimated_frame_ms。
+影响：整段吞吐折算、单次前向延迟和真实在线系统延迟不能互相替代。当前计时也不覆盖原始数据读取、关联注册、网络传输和前端显示的全链路耗时。
+建议：统一命名并显示 T、batch、设备、预热次数、测量次数与统计量；正式门限旁显示实际参与判定的同一时延值。T=1 测速本身不证明 T=100 模型已经满足在线因果跟踪。
+
+W17【P1｜代码确认】冷启动剔除与有效点分母的说明不充分
+代码依据：tracking_system/backend/batch_testing.py:605、608、645、655。
+当前行为：存在多个 batch 时，batch 耗时均值/P95 排除第一个 batch；total_inference_ms 仍包含它，estimated_frame_ms 和部分吞吐估计也由累计耗时计算。cold_start_batch_excluded 字段没有逐项限定适用指标。
+另一个口径：有效点分母排除了 warmup 或无效真值点，但模型仍处理完整 T=100 输入。因此即使计算工作量相同，改变 warmup 也会改变 estimated_frame_ms。
+影响：只读“已剔除冷启动”或“每帧耗时”可能误解实际计算方式。
+建议：逐项标注冷启动处理；分别报告实际处理帧数、评分点数、总耗时、稳态前向时延和有效评分点吞吐。
+
+W18【P1｜代码确认】运行签名与哈希覆盖不足，排队时也未冻结输入
+代码依据：tracking_system/backend/batch_testing.py:34、458、515；tracking_system/backend/evaluation.py:78、190。
+当前行为：runtime_code_sha256 只覆盖 src/model.py、src/dataset.py、src/dataset_pkl.py、backend/batch_testing.py；没有覆盖全部推理、场景选择、评估、预处理脚本、依赖版本和运行环境。权重与数据身份在任务实际执行时产生，不是在提交排队时冻结。
+影响：排队后替换磁盘文件，任务会用执行时的内容；PKL 哈希也不能说明对应的原始 MAT 和生成代码。证据匹配任务中的已记录签名，不等于自动重新验证当前磁盘上的所有文件或比较条件。
+建议：明确“提交配置”和“执行快照”的区别；冻结实际权重、文件列表、数据、完整依赖代码与环境；记录原始数据到注册产物的对应身份。
+
+七、报告中心、导出与追溯
+
+W19【P1｜已实测、代码确认】报告列表缺少 formal_evidence_complete 字段
+代码依据：tracking_system/backend/evaluation.py:529、549；tracking_system/frontend/src/views/ReportCenterView.vue:181。
+当前行为：后端报告目录只返回 assessment 的 overall_status 和 summary，未返回 formal_evidence_complete；前端却据此决定显示“正式证据未齐”或通过计数。
+验证：临时任务中完整 assess_job 结果为正式证据齐备，目录摘要仍缺少该字段。
+影响：同一记录可同时显示“全部通过”和“正式证据未齐”。
+建议：统一完整评估和目录摘要的数据结构，返回该字段，并明确证据未知与证据缺失的区别。
+
+W20【P1｜静态代码确认，实际打印待验】打印样式隐藏了报告所在父容器
+代码依据：tracking_system/frontend/src/style.css:368；tracking_system/frontend/src/App.vue:151；tracking_system/frontend/src/views/ReportCenterView.vue:230。
+当前行为：打印 CSS 把 .workspace 设为 display:none!important；报告抽屉位于该容器的组件内部，没有 Teleport 到容器之外。对子元素 report-backdrop/report-drawer 设置位置样式，无法恢复已隐藏父元素内的内容。
+影响：从当前 DOM 与 CSS 可判断存在报告内容被整体隐藏的风险，可能出现空白或缺失报告的打印/PDF。
+建议：将打印内容放到可打印根节点，或只隐藏与报告无关的兄弟区域。修复后做浏览器打印预览及 PDF 检查；本次尚未实际打印验证。
+
+W21【P1｜已实测、代码确认】前端允许选择超过后端限制的对比导出记录
+代码依据：tracking_system/frontend/src/views/ReportCenterView.vue:73、126；tracking_system/backend/server.py:355。
+当前行为：前端可以对目录中的记录全选，最多覆盖 200 条；后端单次对比 CSV 最多允许 50 个 job_id。
+验证：已通过实际控制器逻辑验证 51 条会返回 422 拒绝。
+影响：用户完成选择后才发现无法导出，界面没有提前说明或限制。
+建议：前后端统一上限，显示可选数量并限制选择，或实现分批导出。
+
+W22【P1｜代码确认】报告目录没有分页，超过 200 条的旧记录无法在界面检索
+代码依据：tracking_system/backend/server.py:350；tracking_system/backend/evaluation.py:529。
+当前行为：目录最多返回最近 200 条，前端筛选只作用于已返回记录；目录汇总数量也只统计该批记录。
+影响：历史文件仍可能保留，但无法通过当前界面筛选找到，汇总数量也不代表全部历史报告。
+建议：提供服务端筛选与分页/游标，区分总记录数和当前页记录数。
+
+W23【P1｜已实测、代码确认】综合评估导出是动态重算，没有不可变的评估版本
+代码依据：tracking_system/backend/evaluation.py:599；tracking_system/frontend/src/views/ReportCenterView.vue:219、225。
+当前行为：每次下载都重新调用 assess_job，使用当前证据与可选手填基线；generated_at 是本次生成时间，不是首次验收结论形成时间。证据脚本会覆盖同一路径的证据文件。
+验证：临时任务不变，将关联率证据从 0.9 改为 0.8，再次导出的结论从通过变成不通过。此验证没有改动历史报告。
+另一个界面边界：下载链接直接带当前 baselineRmse 输入值；用户尚未点击“应用复核值”时，下载内容也可能采用该值，与屏幕上已加载的评估不同。
+影响：任务 ID 不足以唯一定位一次已签发结论；屏幕、先前下载和后续下载可能不是同一评估版本。
+建议：保留动态复核能力，同时增加不可变评估快照，绑定规则、代码、证据内容哈希、手填参数与生成版本；下载明确选择屏幕版本或重新计算版本。
+
+W24【P1｜代码确认】下载报告不是完整的独立复核材料
+代码依据：tracking_system/backend/server.py:286、299、355；tracking_system/backend/evaluation.py:599。
+当前产物：原始任务 JSON、逐轨迹 CSV、对比 CSV、综合评估 JSON。逐轨迹 CSV 只有轨迹名、valid_frames、RMSE、MAE、P95、max 等汇总列；不包含完整观测、逐点预测和真值。对比 CSV 未包含完整 warmup、取样清单、哈希、环境与证据版本。
+综合评估 JSON 也没有打包全部独立证据原文，例如完整时延 samples_ms、基线逐文件明细和对应输入文件。
+影响：逐轨迹 CSV 可以按 valid_frames 对 RMSE 加权重建全局 RMSE，但不能据此重算每个点的误差或全局位置 P95；离开服务器后，部分证据路径不可访问，无法独立完成全部复核。
+建议：区分“摘要导出”和“正式复核包”；正式包冻结并包含任务、参数、输入清单、必要逐点结果、原始证据、规则与代码/环境身份。
+
+W25【P1｜代码确认】跨任务排名和历史参考矩阵没有保证同条件比较
+代码依据：tracking_system/backend/evaluation.py:491、619、632；tracking_system/frontend/src/views/PerformanceEvaluationView.vue:251。
+当前行为：跨任务对比允许混合模型、数据集、取样范围、warmup 与设备，直接展示并高亮最小 RMSE；历史参考和跨数据集矩阵读取已有 JSON，不会自动重新评测当前代码与权重。
+影响：显示的“最小值”不能直接解释为算法更优，历史矩阵也不能作为当前交付版本已完成全矩阵验收的证明。
+建议：按数据身份、评分点、warmup、传感器条件和任务目的检查可比性；对不匹配任务给出明确说明。历史记录单列来源、时间与版本。
+
+八、交付归档与复现
+
+W26【P0｜已逐文件检查 ZIP】现有软件交付 ZIP 仍引用已经删除的 train_cv
+相关源码：scripts/delivery/package_algorithm_software.py；scripts/evaluation/ 下的评估入口。
+已检查实际文件：artifacts/delivery/3 端到端融合跟踪算法软件.zip，43,333,132 字节。
+归档根目录：end_to_end_tracking_software/。ZIP 中有正式 train.py，没有根目录 train_cv.py，但下列 5 个文件仍执行 from train_cv import forward_batch：
+  scripts/evaluation/eval_dataset.py
+  scripts/evaluation/evaluate_cross_dataset.py
+  scripts/evaluation/evaluate_modes.py
+  scripts/evaluation/run_ablation.py
+  scripts/evaluation/run_v7_ablation.py
+现状：工作区上述入口的引用已随训练脚本更名修正，现有交付 ZIP 没有同步重建。在独立解压、没有外部旧模块补充的环境中，这些入口会因缺失 train_cv 而无法导入。
+补充检查：ZIP 内 SHA256清单.json 的 264 个文件哈希与大小均匹配，说明归档内部清单一致；这不能证明程序入口可运行或归档已与最新源码同步。当前实际 ZIP 名称也不同于打包脚本默认的旧输出名；没有发现与该实际软件 ZIP 同名的 .sha256 旁文件。
+建议：按最终交付文件名重建软件包，更新内部清单和外部 ZIP 哈希，在隔离解压环境中验证训练、推理及各评测入口。当前只是记录问题，未重打包或覆盖原 ZIP。
+
+W27【P0｜已检查两份 ZIP】交付内容缺少复现历史模型指标所需的注册 PKL
+已检查数据包：artifacts/delivery/2 面向机载协同跟踪场景的多源异构仿真数据集.zip，2,693,808,972 字节；含 30,001 个 MAT、1 个 MD、1 个 CSV，没有 PKL。
+软件包检查：含历史批量报告与指标 JSON，没有 data/ 或 docs/ 目录项，也没有上述历史注册 PKL。正式 Word 文档另有交付文件，不应由此误判其整体缺失。
+影响：两份 ZIP 提供了原始数据与部分结果，但没有冻结历史指标对应的模型输入。此前已发现当前源码重注册数组与历史 PKL 不一致，因此“从 MAT 用当前代码重新生成”暂不能保证复现历史 V7 约 7.4882 m 的同一输入与结果。
+建议：明确选择一种可复现路线：交付指标对应的冻结注册数据及生成身份；或用当前统一处理链重新生成、完整评测并发布新的指标与证据。仅补结果 JSON 或哈希清单不能补足输入链。
+
+九、需要写入使用说明的系统边界
+
+B01【代码确认】“实时回放”不是已经实现在线因果跟踪。
+依据：tracking_system/backend/server.py:406、416、477；runtime.py:224。
+Web 先对完整轨迹推理，再通过 WebSocket 逐帧发送缓存结果，默认每帧 sleep(0.05)。展示速度不等于数据时间步长，也不等于在线端到端延迟。若最终只要求完整序列推理与可视化，这是能力边界说明；若要求在线跟踪，则还需单独改造与验收。
+
+B02【代码确认】Web 主推理和主批量路径消费预注册 PKL。
+原始 MAT 的目标关联与注册不在 Web 主模型推理闭环中；独立证据脚本读取 MAT 不等于 Web 已支持实时原始传感器接入。交付流程要说明先处理数据、再推理的前置步骤。
+
+B03【代码确认】模型管理是固定目录映射，不是通用模型仓库。
+依据：tracking_system/backend/model_manager.py:23、74、102。
+当前登记 V5/V6/V7 三个固定路径；刷新不会自动发现任意新训练目录，界面没有模型上传/注册功能，TRACKER_MODEL_PATH 也需匹配登记模型。激活选择保存在内存，重启后按配置重新默认选择，而非持久化沿用上次选择。
+
+B04【已实测、代码确认】切模型不会自动切换默认数据目录。
+同一个 ModelManager 的 data_dir 在初始化时确定，默认指向 V7 数据；切到 V5/V6 权重，单场景仍可使用该默认数据。这可以是有意的跨数据集测试，但页面和报告必须明确模型与数据身份。
+
+B05【已实测、代码确认】“加载成功”与“已完成推理/达标”不同。
+依据：tracking_system/backend/runtime.py:114；server.py:134；model_manager.py:209。
+加载使用严格 state_dict 匹配并进入 eval 模式；没有自动执行代表样本前向。已实际在 CPU 加载 V5/V6/V7，当前架构均为 496,623 参数；加载失败时旧引擎会保留，这是已验证的保护行为。/api/health 首次访问也会触发初始化与模型加载，不能视为完全独立于模型和数据的存活探针。
+
+B06【代码确认】批量任务串行，不等于全系统资源互斥。
+依据：tracking_system/backend/batch_testing.py:223、298、610。
+批量执行器 max_workers=1，批量任务之间串行；Web 推理等其他路径仍可能并发占用 CPU/GPU。num_workers 是 DataLoader 参数，不是批量任务并发数。取消通常在 batch 边界检查，末尾基准测试不保证即时取消；服务重启会将未结束任务标为 failed，不会自动续跑。
+
+B07【代码确认】界面默认与直接 API 默认范围不同。
+依据：tracking_system/frontend/src/views/BatchTestingView.vue:28；tracking_system/backend/server.py:123。
+界面默认 V7 模型、scenario_cooperative、抽样 10 个场景、warmup=5、batch_size=64、workers=0；直接 API 默认数据集为 V7，max_scenarios=None。应在提交后和报告中明确实际范围，避免把快速检查当成完整验证。
+
+B08【代码确认】批量中的 batch 与轨迹单位不是场景数或帧数。
+依据：tracking_system/backend/batch_testing.py:180。
+一个文件的多个 RegisteredTrack 会被拆成独立目标序列。batch_size=64 表示最多 64 条目标序列，不是 64 帧或 64 个场景；当前模型这一路径也不等价于对完整场景进行多目标身份连续性评测。
+
+B09【已实测、代码确认】位置指标是有效真值点上的三维距离聚合。
+依据：tracking_system/backend/batch_testing.py:115、558、629。
+使用绝对 ECEF 位置的 x/y/z 三维欧氏距离；stable_stage_mask 排除每条序列前 warmup 个索引位置，而不是前 warmup 个有效观测。传感器缺测但真值有效的点仍参与评分，这是评估缺测跟踪能力的一种合理选择，需明确说明。
+全局 RMSE=sqrt(全部有效点误差平方的均值)；mean_track_rmse_m 是各轨迹 RMSE 的简单均值，二者不同。位置点 P95 与轨迹 RMSE 的 P95 也不同。整体 RMSE 达标不能推导每条轨迹或每类场景全部达标。
+
+B10【代码确认】独立单帧时延脚本覆盖范围有限。
+依据：scripts/evaluation/benchmark_v7_acceptance.py:66。
+当前脚本只接受 model_id=v7 且 dataset_id=v7，默认预热 50 次、测量 300 次，分别报告 T=1 与 T=100；同源场景别名也不会自动被接受。若其他模型/数据组合要形成同等级正式证据，需要扩展并重新验证。
+
+B11【代码确认】后端功能验收通过不等于四项技术指标全部达标。
+依据：tracking_system/backend/acceptance.py:81 及后续检查。
+当前黑盒功能检查覆盖健康状态、模型激活、WebSocket、批量任务与下载等；对评估结果主要检查有四项指标且存在评测轨迹，没有以 overall_status=passed 作为整个功能检查的通过条件。
+建议在交付记录中分别出具功能可用性结果与技术指标验收结果。
+
+十、已有验证记录与尚未完成的验证
+
+已有验证（在前面梳理过程中完成，本次整理未重新运行全部测试）：
+1. V5/V6/V7 CPU 严格加载、重复激活跳过加载、刷新不重载、切模型不切默认数据，以及模拟加载失败保留原引擎。
+2. V7 CPU 小规模批量流程：分层取 2 个文件 track_ca_0000、track_cssw_0000，共 6 条轨迹、570 个评分点；全局 RMSE=9.049711921987033 m，轨迹 RMSE 简单均值=8.787282003996363 m，关联率未提供；由逐轨迹结果按 valid_frames 加权可准确重建全局 RMSE。
+   这是流程检查样本，不是完整验证集结果，不能据此否定或替代历史全量约 7.4882 m 的记录。
+3. 12 项已有 evaluation 测试，以及 5 项批量/场景目录相关测试通过；另用临时夹具复现了 W01、W02 等现有测试未覆盖的逻辑缺口。“已有测试通过”不代表上述问题不存在。
+4. 使用临时任务和实际控制器函数检查 JSON/CSV 导出、报告目录摘要、动态重评估和 51 条对比导出上限。没有完成真实 HTTP 全链路测试；当时 TestClient 所需 httpx 不可用，未为此安装依赖。
+5. 只读检查现有软件 ZIP 与数据 ZIP；软件包内部 264 项哈希和大小全部匹配，同时发现旧 train_cv 引用与注册输入缺失。
+
+尚未完成：
+1. 前端浏览器自动化、设备切换的实际界面操作、打印预览与生成 PDF。
+2. CUDA 环境下的完整推理和正式性能复测。
+3. 将当前源码重注册数据与模型、关联率、IMM-JPDA、时间轴全部统一后的完整评测。
+4. 软件 ZIP 重建及隔离环境解压后的全部入口运行验证。
+5. 按最终验收细则统一门限、warmup、统计范围与比较条件后的正式签发评估。
+
+十一、建议处理顺序
+
+第一步：先统一验收条件并修复 W01、W02；对齐 V8 时间轴、关联处理链和基线比较条件（W03～W05）。
+第二步：冻结权重、数据、代码与环境身份，修正时延命名和统计口径（W07、W10、W16～W18）。
+第三步：修复表单选择、报告摘要、打印、选择上限和历史查询问题（W08、W12、W13、W19～W22）。
+第四步：建立不可变评估版本与完整复核包，说明历史参考及系统能力边界（W09、W14、W15、W23～W25、B01～B11）。
+第五步：选择可复现的数据路线，重建交付 ZIP 与哈希清单，并在独立环境验证（W26、W27）。
+
+以上为待处理清单，不表示对应修复已经完成。

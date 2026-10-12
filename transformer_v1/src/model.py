@@ -60,7 +60,7 @@ def radar_body_to_world_xyz(radar: torch.Tensor, uav_pos: torch.Tensor, rotmat_b
     """
     Convert body-frame radar spherical measurements to world-frame target xyz.
 
-    radar:     [..., 3] = [r, az, el]  (body frame)
+    radar:     [..., 3] = [az, el, r]  (body frame)
     uav_pos:   [..., 3] = [x_uav, y_uav, z_uav]
     euler_rpy: [..., 3] = [roll, pitch, yaw]
 
@@ -233,7 +233,7 @@ class LearnedKFrontEnd(nn.Module):
     ) -> torch.Tensor:
         """
         Build coarse observed state z_obs from radar + async links.
-        radar:      [B,T,N,3]  body-frame [r,az,el]
+        radar:      [B,T,N,3]  body-frame [az,el,r]
         fast_link:  [B,T,N,3]
         slow_link:  [B,T,N,3]
         euler_rpy:  [B,T,N,3]  [roll,pitch,yaw]
@@ -446,7 +446,7 @@ class CoopTrackerModel(nn.Module):
 
         self.k_front = LearnedKFrontEnd(feature_dim=d_model)
 
-        # radar: [r,az,el] + [x,y,z](corrected world geo) + [k_state(6)]
+        # radar: [az,el,r] + [x,y,z](corrected world geo) + [k_state(6)]
         self.radar_enc = ChannelMaskEncoder(input_dim=12, d_model=d_model)
         self.eo_enc = ChannelMaskEncoder(input_dim=5, d_model=d_model)
         self.esm_enc = ChannelMaskEncoder(input_dim=5, d_model=d_model)

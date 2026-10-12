@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 from src.model import CoopTrackerModel
 from src.dataset_pkl import RegisteredPklDataset
-from train_cv import forward_batch
+from train import forward_batch
 
 def evaluate_combination(model_path, data_dir, device):
     print(f"Loading dataset from {data_dir}...")
@@ -54,7 +54,7 @@ def main():
         "Val-v5 (Standard)": PROJECT_ROOT / "data" / "val_data_v5_registered",
         "Val-v6 (-30% Noise)": PROJECT_ROOT / "data" / "val_data_v6_registered",
         "Val-v7 (-40% Noise)": PROJECT_ROOT / "data" / "val_data_v7_registered",
-        "Val-v8 (Interference)": PROJECT_ROOT / "data" / "val_data_v8_interference_registered",
+        "Val-v8 (Interference)": PROJECT_ROOT / "data" / "val_data_v8_interference_registered_10hz",
     }
 
     results_matrix = {}

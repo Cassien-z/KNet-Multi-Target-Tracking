@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.dataset_pkl import RegisteredPklDataset
 from src.model import CoopTrackerModel
-from train_cv import forward_batch
+from train import forward_batch
 
 
 def summarize_association(data_dir: Path, allowed_names: set[str] | None = None) -> dict | None:

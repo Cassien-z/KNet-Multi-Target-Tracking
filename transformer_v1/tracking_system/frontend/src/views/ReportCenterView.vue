@@ -115,7 +115,7 @@ async function reassess() {
   assessing.value = true
   try {
     detailAssessment.value = await getBatchAssessment(detailRecord.value.id, baselineRmse.value ?? undefined)
-    emit('notice', baselineRmse.value ? '已使用同条件基线重新生成判定' : '已恢复无基线判定', 'success')
+    emit('notice', baselineRmse.value ? '已使用同条件基线生成技术复核结果；正式结论仍要求独立证据' : '已恢复无基线判定', 'success')
   } catch (error) {
     emit('notice', error instanceof Error ? error.message : '评估判定失败', 'error')
   } finally {
@@ -178,7 +178,7 @@ onMounted(loadPage)
                 <td><b>{{ record.name }}</b><small>{{ record.id }}</small></td>
                 <td><span class="report-pair">{{ record.model_id?.toUpperCase() || '—' }}</span><i>×</i><span>{{ record.dataset_id?.toUpperCase() || '—' }}</span><small>{{ record.scope ?? '完整数据集' }}{{ record.scope ? ' 场景' : '' }}</small></td>
                 <td v-if="record.metrics"><b :class="{ 'best-report': record.metrics.position_rmse_m === bestRmse }">{{ formatNumber(record.metrics.position_rmse_m) }} m</b><small>RMSE · {{ record.metrics.evaluated_tracks ?? '—' }} 航迹</small></td><td v-else><b>—</b><small>无结果数据</small></td>
-                <td><span class="archive-verdict" :class="record.assessment?.overall_status || record.status">{{ record.status === 'completed' ? verdictText(record.assessment?.overall_status) : statusText(record.status) }}</span><small v-if="record.assessment">{{ record.assessment.summary.passed }}/{{ record.assessment.summary.total }} 项通过</small></td>
+                <td><span class="archive-verdict" :class="record.assessment?.overall_status || record.status">{{ record.status === 'completed' ? verdictText(record.assessment?.overall_status) : statusText(record.status) }}</span><small v-if="record.assessment">{{ record.assessment.formal_evidence_complete ? `${record.assessment.summary.passed}/${record.assessment.summary.total} 项通过` : '正式证据未齐' }}</small></td>
                 <td>{{ formatDate(record.finished_at) }}<small>{{ formatBytes(record.artifacts.report_size_bytes) }}</small></td>
                 <td><span class="artifact-count">{{ [record.artifacts.raw_json, record.artifacts.tracks_csv, record.artifacts.assessment_json].filter(Boolean).length }}</span><small>种格式</small></td>
                 <td><button class="row-action" aria-label="打开报告" @click="openDetail(record)"><AppIcon name="arrow" :size="16" /></button></td>
@@ -208,7 +208,7 @@ onMounted(loadPage)
           <div class="report-document-meta"><div><span>模型</span><b>{{ detailJob.config.model_id.toUpperCase() }}</b></div><div><span>数据集</span><b>{{ detailJob.config.dataset_id.toUpperCase() }}</b></div><div><span>测试范围</span><b>{{ detailJob.config.max_scenarios ?? '完整数据集' }}</b></div><div><span>完成时间</span><b>{{ formatDate(detailJob.finished_at) }}</b></div></div>
 
           <section v-if="detailAssessment" class="report-verdict-block" :class="detailAssessment.overall_status">
-            <div><span>任务书综合结论</span><h3>{{ verdictText(detailAssessment.overall_status) }}</h3><small>{{ detailAssessment.summary.passed }} 通过 · {{ detailAssessment.summary.failed }} 未通过 · {{ detailAssessment.summary.unavailable }} 数据不足</small></div>
+            <div><span>任务书综合结论</span><h3>{{ verdictText(detailAssessment.overall_status) }}</h3><small>{{ detailAssessment.summary.passed }} 通过 · {{ detailAssessment.summary.failed }} 未通过 · {{ detailAssessment.summary.unavailable }} 数据不足{{ detailAssessment.formal_evidence_complete ? '' : ' · 正式证据未齐' }}</small></div>
             <strong>{{ detailAssessment.summary.passed }}<small>/{{ detailAssessment.summary.total }}</small></strong>
           </section>
 
@@ -216,7 +216,7 @@ onMounted(loadPage)
 
           <section v-if="detailAssessment" class="report-criteria-section"><div class="mini-section-title"><span>四项技术指标</span><small>任务书自动判定</small></div><div class="report-criteria-list"><div v-for="criterion in detailAssessment.criteria" :key="criterion.id" :class="criterion.status"><i></i><span><b>{{ criterion.name }}</b><small>{{ criterion.note || `${criterion.operator} ${criterion.display_threshold || `${criterion.threshold} ${criterion.unit}`}` }}</small></span><strong>{{ criterion.value === null ? 'N/A' : `${formatNumber(criterion.unit === 'ratio' ? criterion.value * 100 : criterion.value, 2)}${criterion.unit === 'ratio' ? '%' : ` ${criterion.unit}`}` }}</strong></div></div></section>
 
-          <section v-if="detailRecord.status === 'completed'" class="report-baseline-control no-print"><label><span>同条件 IMM-JPDA RMSE <small>可选</small></span><div><input v-model.number="baselineRmse" type="number" min="0.0001" step="0.01" placeholder="输入基线后重新判定" /><em>m</em></div></label><button :disabled="assessing" @click="reassess">{{ assessing ? '判定中…' : '应用基线' }}</button></section>
+          <section v-if="detailRecord.status === 'completed'" class="report-baseline-control no-print"><label><span>同条件 IMM-JPDA RMSE <small>仅供技术复核</small></span><div><input v-model.number="baselineRmse" type="number" min="0.0001" step="0.01" placeholder="输入复核值" /><em>m</em></div></label><button :disabled="assessing" @click="reassess">{{ assessing ? '复核中…' : '应用复核值' }}</button></section>
           <section v-if="detailJob.error" class="drawer-error"><b>任务错误</b><span>{{ detailJob.error }}</span></section>
 
           <div class="report-downloads no-print">

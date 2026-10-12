@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
-from src.dataset import SingerDataset
+from src.dataset_pkl import RegisteredPklDataset
 from src.model import CoopTrackerModel
 
 
@@ -92,11 +92,13 @@ class MetricMeter:
         }
 
 
-def compute_pos_rel_stats(loader, device):
+def compute_pos_rel_stats(loader, device, max_batches=50):
     sums = None
     sq_sums = None
     count = 0
-    for batch in loader:
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
         y = batch["label_pos_rel"].to(device)
         if sums is None:
             sums = y.sum(dim=(0, 1))
@@ -114,11 +116,13 @@ def compute_pos_rel_stats(loader, device):
     return mean, std
 
 
-def compute_vel_stats(loader, device):
+def compute_vel_stats(loader, device, max_batches=50):
     sums = None
     sq_sums = None
     count = 0
-    for batch in loader:
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
         v = batch["label_abs"].to(device)[:, :, [1, 3, 5]]
         if sums is None:
             sums = v.sum(dim=(0, 1))
@@ -131,7 +135,8 @@ def compute_vel_stats(loader, device):
     mean = sums / count
     var = (sq_sums / count) - mean ** 2
     std = torch.sqrt(var.clamp_min(1e-6))
-    floor = torch.tensor([1.0, 1.0, 1.0], device=device)
+    # CV 数据集速度几乎不变，方差极小，提高 floor 防止归一化后数值爆炸
+    floor = torch.tensor([5.0, 5.0, 5.0], device=device)
     std = torch.maximum(std, floor)
     return mean, std
 
@@ -145,12 +150,10 @@ def forward_batch(model, batch, device, mode="full"):
     e_mask = batch["eo_mask"].to(device)
     esm_mask = batch["esm_mask"].to(device)
 
-    # 【关键修改】屏蔽僚机原始传感器
-    # 强制模型对于僚机（uav_id >= 1）只能使用 fast_link 通道，
-    # 避免模型在训练中直接使用完美对齐的 raw sensor 而不学融合特征。
-    r_mask[:, :, 1:] = 0.0
-    e_mask[:, :, 1:] = 0.0
-    esm_mask[:, :, 1:] = 0.0
+    # Removed masking of wingman raw sensors so the model can learn from all UAVs' raw data.
+    # r_mask[:, :, 1:] = 0.0
+    # e_mask[:, :, 1:] = 0.0
+    # esm_mask[:, :, 1:] = 0.0
     label_abs = batch["label_abs"].to(device)
     label_pos_rel = batch["label_pos_rel"].to(device)
     ref_pos = batch["ref_pos"].to(device)
@@ -171,10 +174,16 @@ def forward_batch(model, batch, device, mode="full"):
         e_mask = torch.zeros_like(e_mask)
         esm_mask = torch.zeros_like(esm_mask)
         use_gat = True
+        use_temporal = True
     elif mode == "dual_no_gat":
         use_gat = False
+        use_temporal = True
+    elif mode == "no_temporal":
+        use_gat = True
+        use_temporal = False
     else:
         use_gat = True
+        use_temporal = True
 
     pred = model(
         radar=radar,
@@ -196,6 +205,7 @@ def forward_batch(model, batch, device, mode="full"):
         esm_mode=esm_mode,
         dt=dt,
         use_gat=use_gat,
+        use_temporal=use_temporal,
     )
     pred_pos_rel = pred[:, :, [0, 2, 4]] - ref_pos.unsqueeze(1)
     return pred, label_abs, label_pos_rel, pred_pos_rel
@@ -225,9 +235,10 @@ def train_one_epoch(
         label_n = (label_pos_rel - pos_mean) / pos_std
 
         regression_loss = criterion(pred_n, label_n)
-        # 建议将 smooth_loss 也进行标准化（例如除以 vel_std）
-        pred_diff = (pred_pos_rel[:, 1:] - pred_pos_rel[:, :-1]) / vel_std[:, :, :3]
-        label_diff = (label_pos_rel[:, 1:] - label_pos_rel[:, :-1]) / vel_std[:, :, :3]
+        # smooth_loss: 位置差分（≈速度×dt，单位 m/step）应除以 pos_std 归一化
+        # 原来除以 vel_std（绝对速度 std，单位 m/s）尺度错误
+        pred_diff = (pred_pos_rel[:, 1:] - pred_pos_rel[:, :-1]) / pos_std
+        label_diff = (label_pos_rel[:, 1:] - label_pos_rel[:, :-1]) / pos_std
         smooth_loss = criterion(pred_diff, label_diff)
 
         # smooth_loss = criterion(
@@ -239,6 +250,8 @@ def train_one_epoch(
         label_vel_n = (label_abs[:, :, [1, 3, 5]] - vel_mean) / vel_std
         vel_loss = criterion(pred_vel_n, label_vel_n)
 
+        # 速度损失权重调整：因为 pred_vel_n 和 label_vel_n 都已经通过各自的 std 归一化到了同等无量纲尺度 (均值为0，方差为1)。
+        # 它们的 MSE loss 在同一数量级（1.0左右），直接乘以 vel_loss_weight 即可让网络正确感受到等比例的速度约束。
         loss = regression_loss + 0.1 * smooth_loss + vel_loss_weight * vel_loss
 
         optimizer.zero_grad()
@@ -432,7 +445,8 @@ def build_summary(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="./data/train_data")
+    parser.add_argument("--data_dir", type=str, default="./data/train_data_single_new_registered")
+    parser.add_argument("--val_data_dir", type=str, default="./data/val_data_fused_new_registered")
     parser.add_argument("--seq_len", type=int, default=100)
     parser.add_argument("--num_uavs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -481,21 +495,40 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     print(f"[Info] 本次结果目录: {os.path.abspath(run_dir)}")
 
-    dataset = SingerDataset(
-        data_dir=data_dir,
-        seq_len=args.seq_len,
-        num_uavs=args.num_uavs,
-        return_extra=True,
-    )
-    if len(dataset) == 0:
-        print("[Error] 未找到数据。")
-        return
+    if args.val_data_dir:
+        val_data_dir = resolve_data_dir(args.val_data_dir)
+        print(f"[Info] 验证数据目录: {val_data_dir}")
+        train_set = RegisteredPklDataset(
+            data_dir=data_dir,
+            seq_len=args.seq_len,
+            num_uavs=args.num_uavs,
+            return_extra=True,
+        )
+        val_set = RegisteredPklDataset(
+            data_dir=val_data_dir,
+            seq_len=args.seq_len,
+            num_uavs=args.num_uavs,
+            return_extra=True,
+        )
+        if len(train_set) == 0 or len(val_set) == 0:
+            print("[Error] 未找到数据。")
+            return
+    else:
+        dataset = RegisteredPklDataset(
+            data_dir=data_dir,
+            seq_len=args.seq_len,
+            num_uavs=args.num_uavs,
+            return_extra=True,
+        )
+        if len(dataset) == 0:
+            print("[Error] 未找到数据。")
+            return
 
-    indices = np.arange(len(dataset))
-    np.random.shuffle(indices)
-    split = int(0.8 * len(indices))
-    train_set = Subset(dataset, indices[:split])
-    val_set = Subset(dataset, indices[split:])
+        indices = np.arange(len(dataset))
+        np.random.shuffle(indices)
+        split = int(0.8 * len(indices))
+        train_set = Subset(dataset, indices[:split])
+        val_set = Subset(dataset, indices[split:])
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -512,17 +545,25 @@ def main():
     pos_mean, pos_std = compute_pos_rel_stats(train_loader, device)
     vel_mean, vel_std = compute_vel_stats(train_loader, device)
     pos_mean = pos_mean.view(1, 1, -1)
-    pos_std = pos_std.view(1, 1, -1)
+    # 强制进行各向同性标准化，防止网络钻空子去拟合方差极小的维度（如 Z 轴）而牺牲物理 X/Y 精度
+    pos_std = pos_std.mean().view(1, 1, 1).expand(1, 1, 3)
     vel_mean = vel_mean.view(1, 1, -1)
-    vel_std = vel_std.view(1, 1, -1)
+    vel_std = vel_std.mean().view(1, 1, 1).expand(1, 1, 3)
 
     train_losses = []
     val_losses = []
     best_rmse = float("inf")
     best_state = None
 
+    # Phase 2 vel_loss 线性 ramp，避免从 0 阶跃到目标权重时梯度爆炸
+    VEL_RAMP_EPOCHS = 10
+
     for epoch in range(1, args.epochs + 1):
-        vel_loss_weight = args.phase2_vel_weight if epoch >= args.phase2_start_epoch else 0.0
+        if epoch < args.phase2_start_epoch:
+            vel_loss_weight = 0.0
+        else:
+            ramp = min(1.0, (epoch - args.phase2_start_epoch + 1) / VEL_RAMP_EPOCHS)
+            vel_loss_weight = args.phase2_vel_weight * ramp
         tr_loss, _ = train_one_epoch(
             model=model,
             loader=train_loader,

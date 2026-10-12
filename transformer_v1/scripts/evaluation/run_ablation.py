@@ -13,7 +13,7 @@ import json
 
 from src.model import CoopTrackerModel
 from src.dataset_pkl import RegisteredPklDataset
-from train_cv import forward_batch
+from train import forward_batch
 
 def run_ablation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

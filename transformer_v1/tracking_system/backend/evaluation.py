@@ -21,7 +21,7 @@ from tracking_system.backend.runtime import PROJECT_ROOT
 
 ACCEPTANCE_CRITERIA: dict[str, dict[str, Any]] = {
     "position_rmse_m": {
-        "name": "位置均方根误差",
+        "name": "跟踪稳定阶段位置均方根误差",
         "operator": "<=",
         "threshold": 8.0,
         "unit": "m",
@@ -43,7 +43,7 @@ ACCEPTANCE_CRITERIA: dict[str, dict[str, Any]] = {
         "source": "任务书",
     },
     "inference_time_ms": {
-        "name": "单帧推理耗时",
+        "name": "单帧跟踪结果生成耗时（模型前向）",
         "operator": "<=",
         "threshold": 100.0,
         "unit": "ms",
@@ -78,16 +78,23 @@ def _read_json(path: Path) -> Any | None:
 def _job_signature(job: dict[str, Any]) -> str:
     """Fingerprint the exact batch scope accepted by metric evidence scripts."""
     config = job.get("config") or {}
-    metrics = (job.get("result") or {}).get("metrics") or {}
+    result = job.get("result") or {}
+    metrics = result.get("metrics") or {}
     identity = {
         "job_id": job.get("id"),
         "model_id": config.get("model_id"),
         "dataset_id": config.get("dataset_id"),
+        "device": config.get("device"),
+        "batch_size": config.get("batch_size"),
+        "workers": config.get("workers"),
         "max_scenarios": config.get("max_scenarios"),
         "warmup_frames": config.get("warmup_frames"),
         "sequence_length": config.get("sequence_length"),
         "evaluated_scenarios": metrics.get("evaluated_scenarios"),
         "position_rmse_m": metrics.get("position_rmse_m"),
+        "model_path": result.get("model_path"),
+        "dataset_path": result.get("dataset_path"),
+        "provenance": result.get("provenance"),
     }
     scenario_files = ((job.get("result") or {}).get("scenario_manifest") or {}).get("files")
     if config.get("sampling_strategy") is not None:
@@ -135,6 +142,9 @@ def _summarize_tracks(tracks: list[dict[str, Any]]) -> dict[str, Any]:
 
     rmses = np.asarray([float(item["rmse_m"]) for item in tracks], dtype=np.float64)
     distribution = {
+        "track_count": int(rmses.size),
+        "mean_rmse_m": float(np.mean(rmses)),
+        "standard_deviation_rmse_m": float(np.std(rmses)),
         "minimum_rmse_m": float(np.min(rmses)),
         "median_rmse_m": float(np.median(rmses)),
         "p75_rmse_m": float(np.percentile(rmses, 75)),
@@ -198,6 +208,15 @@ class EvaluationService:
             "path": str(path),
             "command": command,
         }
+        provenance = ((job.get("result") or {}).get("provenance") or {})
+        required_provenance = {
+            "model_sha256",
+            "dataset_sha256",
+            "runtime_code_sha256",
+        }
+        if not required_provenance.issubset(provenance):
+            status["message"] = "批测报告缺少模型、数据或运行代码摘要，请重新执行批测"
+            return None, status
         payload = _read_json(path)
         if not isinstance(payload, dict):
             status["message"] = "尚未生成测试证据" if not path.is_file() else "测试证据不是有效 JSON"
@@ -229,6 +248,45 @@ class EvaluationService:
                 status["message"] = "基线测试证据中的 IMM-JPDA RMSE 无效"
                 return None, status
         status.update({"accepted": True, "message": "已加载与当前批测严格匹配的测试证据"})
+        return payload, status
+
+    def _forward_latency_evidence(
+        self, job: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Read a measured T=1 forward distribution tied to the exact batch job."""
+        path = self.evidence_root / str(job["id"]) / "forward_latency.json"
+        status = {"available": path.is_file(), "accepted": False, "path": str(path)}
+        payload = _read_json(path)
+        if not isinstance(payload, dict):
+            status["message"] = "尚无独立单帧前向测试证据" if not path.is_file() else "时延证据不是有效JSON"
+            return None, status
+        provenance = ((job.get("result") or {}).get("provenance") or {})
+        if (
+            payload.get("job_id") != job["id"]
+            or payload.get("job_signature") != _job_signature(job)
+            or payload.get("model_sha256") != provenance.get("model_sha256")
+        ):
+            status["message"] = "时延证据与当前任务、模型或数据范围不匹配"
+            return None, status
+        sample = payload.get("one_frame_input") or {}
+        try:
+            values = np.asarray(sample["samples_ms"], dtype=np.float64)
+            measured_p95 = float(np.percentile(values, 95))
+            reported_p95 = float(sample["p95_ms"])
+        except (KeyError, TypeError, ValueError, IndexError):
+            status["message"] = "时延证据缺少原始计时样本"
+            return None, status
+        if (
+            int(sample.get("sequence_length", 0)) != 1
+            or values.size < 20
+            or int(sample.get("test_iterations", 0)) != values.size
+            or not np.isfinite(values).all()
+            or np.any(values <= 0)
+            or not np.isclose(measured_p95, reported_p95, atol=1e-6)
+        ):
+            status["message"] = "单帧计时样本、统计值或输入长度不一致"
+            return None, status
+        status.update({"accepted": True, "message": "已加载同批次独立单帧前向P95证据"})
         return payload, status
 
     @staticmethod
@@ -319,27 +377,53 @@ class EvaluationService:
         elif association_accuracy is None:
             association_note = f'尚无关联测试证据；运行：{association_status["command"]}'
         else:
-            association_note = "使用注册数据中的 AssociationStats"
-        frame_latency = latency.get("measured_frame_ms", latency.get("estimated_frame_ms"))
-        latency_note = (
-            "单航迹序列重复实测并按序列长度折算"
-            if latency.get("measured_frame_ms") is not None
-            else "按有效目标点折算的历史单帧推理耗时"
-        )
+            association_note = "注册数据中的 AssociationStats 仅供技术复核；正式验收仍需独立证据"
+        forward_evidence, forward_status = self._forward_latency_evidence(job)
+        if forward_evidence is not None:
+            frame_latency = float(forward_evidence["one_frame_input"]["p95_ms"])
+            full_p95 = (forward_evidence.get("full_sequence_input") or {}).get("p95_ms")
+            latency_note = "独立单帧输入T=1前向P95"
+            if isinstance(full_p95, (int, float)):
+                latency_note += f"；完整100帧输入P95={full_p95:.3f} ms另行报告"
+        elif forward_status["available"]:
+            frame_latency = None
+            latency_note = str(forward_status["message"])
+        else:
+            frame_latency = latency.get("measured_frame_ms", latency.get("estimated_frame_ms"))
+            latency_note = (
+                "按完整序列耗时折算，缺少独立单帧前向证据"
+                if latency.get("measured_frame_ms") is not None
+                else "按有效目标点折算的历史单帧推理耗时"
+            )
         improvement = None
         improvement_note = f'尚无同条件基线证据；运行：{rmse_status["command"]}'
         if baseline_rmse_m is not None:
             if baseline_rmse_m <= 0:
                 raise ValueError("baseline_rmse_m must be greater than zero")
             improvement = (float(baseline_rmse_m) - float(rmse)) / float(baseline_rmse_m) * 100.0
-            improvement_note = f"基线 RMSE={baseline_rmse_m:.6g} m（手动提供）"
+            improvement_note = (
+                f"基线 RMSE={baseline_rmse_m:.6g} m（手动提供，仅供技术复核；"
+                "正式验收仍需独立证据）"
+            )
         elif rmse_evidence is not None:
             improvement = float(rmse_evidence["value"])
             baseline_rmse = float(rmse_evidence["imm_jpda_rmse_m"])
-            improvement_note = f"同条件 IMM-JPDA 基线 RMSE={baseline_rmse:.6g} m"
+            improvement_note = (
+                f"同场景、同统计范围 IMM-JPDA 基线 RMSE={baseline_rmse:.6g} m；"
+                "基线仅用长机雷达和僚机快链路，并以首帧真值初始化；"
+                "与V7模型的传感器输入不完全相同"
+            )
 
+        warmup_frames = int((job.get("config") or {}).get("warmup_frames") or 0)
+        rmse_note = (
+            f"仅统计target_valid_mask有效点，并排除每条航迹前{warmup_frames}帧初始过渡阶段"
+        )
         criteria = [
-            _criterion("position_rmse_m", float(rmse) if rmse is not None else None),
+            _criterion(
+                "position_rmse_m",
+                float(rmse) if rmse is not None else None,
+                note=rmse_note,
+            ),
             _criterion(
                 "association_accuracy",
                 float(association_accuracy) if association_accuracy is not None else None,
@@ -355,7 +439,18 @@ class EvaluationService:
         passed = sum(item["status"] == "passed" for item in criteria)
         failed = sum(item["status"] == "failed" for item in criteria)
         unavailable = sum(item["status"] == "unavailable" for item in criteria)
-        overall_status = "failed" if failed else ("incomplete" if unavailable else "passed")
+        formal_evidence_complete = bool(
+            association_status.get("accepted") and rmse_status.get("accepted")
+        )
+        overall_status = (
+            "failed"
+            if failed
+            else (
+                "incomplete"
+                if unavailable or not formal_evidence_complete
+                else "passed"
+            )
+        )
 
         return {
             "job_id": job_id,
@@ -363,6 +458,12 @@ class EvaluationService:
             "model_id": result.get("model_id"),
             "dataset_id": result.get("dataset_id"),
             "overall_status": overall_status,
+            "formal_evidence_complete": formal_evidence_complete,
+            "formal_evidence_requirement": (
+                "项目内自动评估要求同时具备与当前任务签名一致的关联正确率证据和"
+                "IMM-JPDA参考实现对比证据；注册数据统计和手工基线仅供技术复核。"
+                "自动评估不代替甲方验收，基线输入差异见单项说明。"
+            ),
             "summary": {
                 "total": len(criteria),
                 "passed": passed,
@@ -373,6 +474,7 @@ class EvaluationService:
             "evidence": {
                 "association_accuracy": association_status,
                 "rmse_improvement_pct": rmse_status,
+                "forward_latency": forward_status,
             },
             "dimensions": {
                 "accuracy": copy.deepcopy(metrics),

@@ -161,14 +161,14 @@ onMounted(loadPage)
       <div class="assessment-toolbar">
         <div><p class="section-kicker">RUN ASSESSMENT</p><h2>批测任务判定</h2></div>
         <label><span>已完成任务</span><select v-model="selectedJobId" @change="baselineRmse = null; loadAssessment()"><option v-for="job in completedJobs" :key="job.id" :value="job.id">{{ job.name }} · {{ job.config.model_id.toUpperCase() }} × {{ job.config.dataset_id.toUpperCase() }}</option></select></label>
-        <label class="baseline-field"><span>同条件 IMM-JPDA RMSE <small>可选</small></span><div><input v-model.number="baselineRmse" type="number" min="0.0001" step="0.01" placeholder="输入基线" /><em>m</em></div></label>
+        <label class="baseline-field"><span>同条件 IMM-JPDA RMSE <small>仅供技术复核</small></span><div><input v-model.number="baselineRmse" type="number" min="0.0001" step="0.01" placeholder="输入复核值" /><em>m</em></div></label>
         <button class="button button-primary" :disabled="assessing || !selectedJobId" @click="loadAssessment"><AppIcon name="evaluation" :size="17" />{{ assessing ? '计算中' : '重新判定' }}</button>
       </div>
 
       <div v-if="assessment" class="assessment-body">
         <div class="assessment-verdict" :class="assessment.overall_status">
           <div class="verdict-mark"><span>{{ assessment.summary.passed }}</span><small>/ {{ assessment.summary.total }}</small></div>
-          <div><span>OVERALL VERDICT</span><h3>{{ assessmentLabel(assessment.overall_status) }}</h3><p>{{ assessment.job_name }} · {{ assessment.model_id.toUpperCase() }} × {{ assessment.dataset_id.toUpperCase() }}</p></div>
+          <div><span>OVERALL VERDICT</span><h3>{{ assessmentLabel(assessment.overall_status) }}</h3><p>{{ assessment.job_name }} · {{ assessment.model_id.toUpperCase() }} × {{ assessment.dataset_id.toUpperCase() }}</p><p v-if="!assessment.formal_evidence_complete">{{ assessment.formal_evidence_requirement }}</p></div>
           <dl><div><dt>通过</dt><dd>{{ assessment.summary.passed }}</dd></div><div><dt>未通过</dt><dd>{{ assessment.summary.failed }}</dd></div><div><dt>数据不足</dt><dd>{{ assessment.summary.unavailable }}</dd></div></dl>
         </div>
 

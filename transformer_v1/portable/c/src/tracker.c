@@ -55,14 +55,38 @@ static int make_tensor(
 
 Tracker *tracker_create(const tracker_path_char_t *model_path) {
     Tracker *tracker = (Tracker *)calloc(1, sizeof(Tracker));
+    const OrtApiBase *api_base;
+    const char *runtime_version;
+    const char *minor_start;
+    int api_version = ORT_API_VERSION;
+    int runtime_major;
+    int runtime_minor;
     if (tracker == NULL) return NULL;
-    tracker->api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    /* MATLAB R2026a may already have loaded an older onnxruntime.dll into
+       the process. The OrtApi table is append-only, so the functions used
+       here remain ABI compatible when negotiating down to API 17. */
+    api_base = OrtGetApiBase();
+    runtime_version = api_base->GetVersionString();
+    runtime_major = atoi(runtime_version);
+    minor_start = strchr(runtime_version, '.');
+    runtime_minor = minor_start == NULL ? api_version : atoi(minor_start + 1);
+    if (runtime_major == 1 && runtime_minor < api_version) {
+        api_version = runtime_minor;
+    }
+    while (api_version >= 17 && tracker->api == NULL) {
+        tracker->api = api_base->GetApi((uint32_t)api_version);
+        --api_version;
+    }
     if (tracker->api == NULL) {
-        snprintf(tracker->error, sizeof(tracker->error), "Cannot obtain ONNX Runtime API");
+        snprintf(tracker->error, sizeof(tracker->error), "Cannot obtain ONNX Runtime API 17 or newer");
         return tracker;
     }
     if (set_status(tracker, tracker->api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "coop_tracker", &tracker->env)) ||
         set_status(tracker, tracker->api->CreateSessionOptions(&tracker->options)) ||
+        /* The exported model is not repeatable with ORT's memory-pattern
+           planner enabled. Keep the C runtime aligned with the validated
+           Python and MATLAB execution configuration. */
+        set_status(tracker, tracker->api->DisableMemPattern(tracker->options)) ||
         set_status(tracker, tracker->api->SetIntraOpNumThreads(tracker->options, 1)) ||
         set_status(tracker, tracker->api->SetSessionGraphOptimizationLevel(tracker->options, ORT_ENABLE_ALL)) ||
         set_status(tracker, tracker->api->CreateSession(tracker->env, model_path, tracker->options, &tracker->session)) ||

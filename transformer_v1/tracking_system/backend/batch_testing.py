@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import pickle
@@ -30,16 +31,56 @@ from tracking_system.backend.scenario_catalog import (
 
 REPORT_DIR = PROJECT_ROOT / "artifacts" / "reports" / "batch_tests"
 FINAL_STATUSES = {"completed", "failed", "cancelled"}
+RUNTIME_IDENTITY_FILES = (
+    PROJECT_ROOT / "src" / "model.py",
+    PROJECT_ROOT / "src" / "dataset.py",
+    PROJECT_ROOT / "src" / "dataset_pkl.py",
+    PROJECT_ROOT / "tracking_system" / "backend" / "batch_testing.py",
+)
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _files_digest(paths: list[Path] | tuple[Path, ...]) -> str:
+    records = []
+    for path in paths:
+        resolved = path.resolve()
+        records.append(
+            {
+                "name": resolved.name,
+                "size_bytes": resolved.stat().st_size,
+                "sha256": _sha256_file(resolved),
+            }
+        )
+    payload = json.dumps(records, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def ensure_finite_tensor(name: str, value: torch.Tensor) -> None:
+    """Reject non-finite inference values before metrics or reports are produced."""
+    if not bool(torch.isfinite(value).all().item()):
+        raise RuntimeError(f"Non-finite values detected in {name}")
+
+
+def _ensure_finite_array(name: str, value: np.ndarray) -> None:
+    if not np.all(np.isfinite(value)):
+        raise RuntimeError(f"Non-finite values detected in {name}")
+
+
 def _predict_batch(
     model: torch.nn.Module, batch: dict[str, Any], device: torch.device
 ) -> torch.Tensor:
-    return model(
+    prediction = model(
         radar=batch["radar"].to(device),
         eo=batch["eo"].to(device),
         esm=batch["esm"].to(device),
@@ -61,12 +102,39 @@ def _predict_batch(
         use_gat=True,
         use_temporal=True,
     )
+    ensure_finite_tensor("model prediction", prediction)
+    return prediction
 
 
 def _forward_batch(
     model: torch.nn.Module, batch: dict[str, Any], device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _predict_batch(model, batch, device), batch["label_abs"].to(device)
+
+
+def stable_stage_mask(
+    valid_mask: torch.Tensor, warmup_frames: int
+) -> torch.Tensor:
+    """Return the acceptance mask after excluding the initial transition stage."""
+    if warmup_frames < 0:
+        raise ValueError("warmup_frames must be non-negative")
+    mask = valid_mask.bool().clone()
+    if warmup_frames:
+        mask[:, :warmup_frames] = False
+    return mask
+
+
+def position_rmse_definition(warmup_frames: int) -> dict[str, Any]:
+    """Machine-readable definition used by reports and acceptance assessment."""
+    return {
+        "display_name": "跟踪稳定阶段三维位置均方根误差",
+        "formula": "sqrt(mean(||pred_xyz(t)-truth_xyz(t)||_2^2))",
+        "coordinate_system": "ECEF absolute position",
+        "sample_rule": "target_valid_mask=true",
+        "transition_rule": f"exclude first {warmup_frames} frames of every track",
+        "warmup_frames_excluded": warmup_frames,
+        "cold_start_included": False,
+    }
 
 
 def _association_summary(paths: list[Path]) -> dict[str, Any] | None:
@@ -206,6 +274,7 @@ class BatchTestManager:
                     "sensor_modalities": list(metadata.get("sensor_modalities", ())),
                     "interference_modes": list(metadata.get("interference_modes", ())),
                     "scenario_note": metadata.get("scenario_note"),
+                    "quality_profile": copy.deepcopy(metadata.get("quality_profile")),
                 }
             )
         return items
@@ -221,11 +290,13 @@ class BatchTestManager:
             f".json.{threading.get_ident()}.tmp"
         )
         temporary.write_text(
-            json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            json.dumps(job, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
         )
         os.replace(temporary, destination)
 
     def _load_history(self) -> None:
+        recovered_job_ids: list[str] = []
         for path in sorted(self.report_dir.glob("*.json")):
             try:
                 job = json.loads(path.read_text(encoding="utf-8"))
@@ -238,7 +309,11 @@ class BatchTestManager:
                 job["finished_at"] = _utc_now()
                 job["error"] = "Backend restarted before the batch test finished"
                 job.setdefault("progress", {})["message"] = "任务因后端重启而中断"
+                job["progress"]["stage"] = "failed"
+                recovered_job_ids.append(str(job["id"]))
             self._jobs[job["id"]] = job
+        for job_id in recovered_job_ids:
+            self._persist(job_id)
 
     @staticmethod
     def _summary(job: dict[str, Any]) -> dict[str, Any]:
@@ -432,6 +507,13 @@ class BatchTestManager:
                 raise _JobCancelled()
 
             model_path = self.model_manager.get_model_path(config["model_id"])
+            provenance = {
+                "model_path": str(model_path.resolve()),
+                "model_sha256": _sha256_file(model_path),
+                "dataset_path": str(dataset_path),
+                "dataset_sha256": _files_digest(selected_paths),
+                "runtime_code_sha256": _files_digest(RUNTIME_IDENTITY_FILES),
+            }
             device = torch.device(config["device"])
             engine = TransformerEngine(
                 model_path=model_path,
@@ -473,10 +555,12 @@ class BatchTestManager:
                         prediction[..., [0, 2, 4]] - truth[..., [0, 2, 4]],
                         dim=-1,
                     )
-                    mask = batch["target_valid_mask"].to(device).bool()
-                    if config["warmup_frames"]:
-                        mask[:, : config["warmup_frames"]] = False
+                    mask = stable_stage_mask(
+                        batch["target_valid_mask"].to(device),
+                        config["warmup_frames"],
+                    )
                     selected = distances[mask]
+                    ensure_finite_tensor("selected position errors", selected)
                     if selected.numel():
                         point_errors.append(selected.detach().cpu().numpy())
                         valid_points += int(selected.numel())
@@ -487,6 +571,7 @@ class BatchTestManager:
                         if not row_values.numel():
                             continue
                         values = row_values.detach().cpu().numpy().astype(np.float64)
+                        _ensure_finite_array("per-track position errors", values)
                         track_details.append(
                             {
                                 "track": names[row]
@@ -537,6 +622,10 @@ class BatchTestManager:
                             (time.perf_counter() - started) * 1000.0
                         )
             sequence_latencies = np.asarray(single_sequence_latencies, dtype=np.float64)
+            _ensure_finite_array("aggregate position errors", errors)
+            _ensure_finite_array("per-track RMSE values", track_rmses)
+            _ensure_finite_array("batch latency values", steady_latencies)
+            _ensure_finite_array("single-sequence latency values", sequence_latencies)
             metrics = {
                 "position_rmse_m": float(np.sqrt(np.mean(np.square(errors)))),
                 "position_mae_m": float(np.mean(errors)),
@@ -585,7 +674,25 @@ class BatchTestManager:
                     "model_path": str(model_path),
                     "dataset_id": config["dataset_id"],
                     "dataset_path": str(dataset_path),
+                    "provenance": provenance,
                     "metrics": metrics,
+                    "metric_definitions": {
+                        "position_rmse_m": position_rmse_definition(
+                            config["warmup_frames"]
+                        ),
+                        "inference_time_ms": {
+                            "display_name": "单帧跟踪结果生成耗时（模型前向）",
+                            "scope": "aligned and associated multisource tensor input to target state output",
+                            "excludes": [
+                                "file I/O",
+                                "raw detection extraction",
+                                "target association",
+                                "GUI rendering",
+                                "flight-control command generation",
+                            ],
+                            "cold_start_excluded": True,
+                        },
+                    },
                     "latency": latency,
                     "association": association,
                     "scenario_manifest": {

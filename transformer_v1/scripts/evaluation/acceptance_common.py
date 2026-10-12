@@ -42,16 +42,23 @@ def load_batch_report(path: str | Path) -> dict[str, Any]:
 
 def job_signature(report: dict[str, Any]) -> str:
     config = report.get("config") or {}
-    metrics = (report.get("result") or {}).get("metrics") or {}
+    result = report.get("result") or {}
+    metrics = result.get("metrics") or {}
     identity = {
         "job_id": report.get("id"),
         "model_id": config.get("model_id"),
         "dataset_id": config.get("dataset_id"),
+        "device": config.get("device"),
+        "batch_size": config.get("batch_size"),
+        "workers": config.get("workers"),
         "max_scenarios": config.get("max_scenarios"),
         "warmup_frames": config.get("warmup_frames"),
         "sequence_length": config.get("sequence_length"),
         "evaluated_scenarios": metrics.get("evaluated_scenarios"),
         "position_rmse_m": metrics.get("position_rmse_m"),
+        "model_path": result.get("model_path"),
+        "dataset_path": result.get("dataset_path"),
+        "provenance": result.get("provenance"),
     }
     scenario_files = ((report.get("result") or {}).get("scenario_manifest") or {}).get("files")
     if config.get("sampling_strategy") is not None:
@@ -111,7 +118,8 @@ def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.tmp")
     temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
     )
     os.replace(temporary, destination)
     return destination

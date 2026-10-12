@@ -580,6 +580,16 @@ def _parse_registered_pkl(data, seq_len, num_uavs, basename):
     registered_track = data['RegisteredTrack']
     uav_pos_all = data.get('UAV_Pos')
 
+    # Registered PKL files carry their own aligned time grid. Deriving the
+    # period here keeps legacy 10 Hz and high-fidelity 40 Hz data honest.
+    t_grid = np.asarray(data.get("t_grid", []), dtype=np.float64).reshape(-1)
+    dt = 0.1
+    if t_grid.size >= 2:
+        time_steps = np.diff(t_grid)
+        valid_steps = time_steps[np.isfinite(time_steps) & (time_steps > 0.0)]
+        if valid_steps.size:
+            dt = float(np.median(valid_steps))
+
     # 优先使用 pkl 中存储的 UAV_Rotmat（经 fix_uav_rotmat_in_pkls.py 修正后为正确值）。
     # 若文件没有该字段，则实时用向量化差分重建（速度仍远快于旧的 Python 循环）。
     uav_rotmat_all = data.get('UAV_Rotmat')
@@ -590,7 +600,10 @@ def _parse_registered_pkl(data, seq_len, num_uavs, basename):
         else:
             # 回退：向量化重建（无 Python 循环）
             T_total = uav_pos_all.shape[0]
-            t_vals = np.arange(T_total, dtype=np.float64) * 0.1
+            if t_grid.size >= T_total:
+                t_vals = t_grid[:T_total]
+            else:
+                t_vals = np.arange(T_total, dtype=np.float64) * dt
             vel_all = np.gradient(uav_pos_all.astype(np.float64), t_vals, axis=0)
             world_up = np.array([0.0, 0.0, 1.0])
             speed = np.linalg.norm(vel_all, axis=-1, keepdims=True)
@@ -625,7 +638,8 @@ def _parse_registered_pkl(data, seq_len, num_uavs, basename):
             "label_pos_abs": np.zeros((seq_len, 3), dtype=np.float32),
             "label_pos_rel": np.zeros((seq_len, 3), dtype=np.float32),
             "ref_pos": np.zeros((3,), dtype=np.float32),
-            "dt": 0.1,
+            "dt": dt,
+            "global_time": np.zeros((seq_len,), dtype=np.float32),
             "target_valid_mask": np.zeros((seq_len,), dtype=np.float32),
             "fast_update": np.zeros((seq_len, num_uavs), dtype=np.float32),
             "file_name": f"{basename}_target_{i}"
@@ -634,6 +648,10 @@ def _parse_registered_pkl(data, seq_len, num_uavs, basename):
         for t in range(seq_len):
             for u in range(num_uavs):
                 sample["rotmat_b2e"][t, u] = np.eye(3, dtype=np.float32)
+
+        time_count = min(seq_len, t_grid.size)
+        if time_count:
+            sample["global_time"][:time_count] = t_grid[:time_count].astype(np.float32)
 
         # Ground truth
         target_pos = target_dict['target_pos']

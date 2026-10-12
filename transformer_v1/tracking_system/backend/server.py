@@ -13,13 +13,11 @@ import sys
 import threading
 import time
 import uuid
-from bisect import bisect_left
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
 import numpy as np
 import torch
-import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -28,6 +26,7 @@ from pydantic import BaseModel, Field
 from tracking_system.backend.batch_testing import BatchTestManager
 from tracking_system.backend.evaluation import ACCEPTANCE_CRITERIA, EvaluationService
 from tracking_system.backend.model_manager import ModelManager
+from tracking_system.backend.time_utils import nearest_time_index
 
 
 SERVICE_STARTED = time.monotonic()
@@ -75,8 +74,17 @@ async def add_request_context(request: Request, call_next):
                 "request_id": request_id,
             },
         )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
     response.headers["X-Request-ID"] = request_id
-    response.headers["X-Process-Time-Ms"] = f"{(time.perf_counter() - started) * 1000.0:.3f}"
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.3f}"
+    LOGGER.info(
+        "HTTP %s %s -> %s %.3f ms (request_id=%s)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+        request_id,
+    )
     return response
 
 
@@ -433,9 +441,7 @@ async def tracking_endpoint(
         while control["index"] < sequence.frame_count:
             seek_target = control["seek_target"]
             if seek_target is not None:
-                control["index"] = min(
-                    bisect_left(sequence.times, seek_target), sequence.frame_count - 1
-                )
+                control["index"] = nearest_time_index(sequence.times, seek_target)
                 control["seek_target"] = None
                 errors_since_reset.clear()
 
@@ -479,4 +485,6 @@ async def tracking_endpoint(
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     uvicorn.run(app, host="127.0.0.1", port=8000)

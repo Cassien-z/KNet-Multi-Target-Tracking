@@ -27,7 +27,7 @@ const form = reactive({
   name: '',
   model_id: 'v7',
   dataset_id: 'scenario_cooperative',
-  device: 'cuda:0',
+  device: '',
   warmup_frames: 5,
   batch_size: 64,
   workers: 0,
@@ -55,8 +55,13 @@ watch(() => props.data, (data) => {
   if (!data) return
   const active = data.models.find((model) => model.active)
   if (active && !submitting.value) form.model_id = active.id
-  const cuda = data.devices.find((device) => device.available && device.id.startsWith('cuda'))
-  if (cuda && form.device === 'cuda:0') form.device = cuda.id
+  const available = data.devices.filter((device) => device.available)
+  if (!available.some((device) => device.id === form.device)) {
+    const activeDevice = data.health.active_model.device
+    form.device = available.find((device) => device.id === activeDevice)?.id
+      ?? available[0]?.id
+      ?? ''
+  }
 }, { immediate: true })
 
 function statusText(status: BatchJobStatus): string {

@@ -1,40 +1,43 @@
 function prediction = run_tracker(modelPath, input)
-%RUN_TRACKER Execute the fixed-shape end-to-end tracker in MATLAB.
-%   PREDICTION = RUN_TRACKER(MODELPATH, INPUT) loads the shared ONNX model
-%   and returns a single-precision [1,100,6] state sequence. INPUT must
-%   contain every field listed below with the shapes from manifest.json.
-
-persistent net loadedModelPath
+%RUN_TRACKER Execute the fixed-shape end-to-end tracker from MATLAB.
+%   PREDICTION = RUN_TRACKER(MODELPATH, INPUT) calls the packaged MEX/ONNX
+%   Runtime implementation and returns a single [1,100,6] array. INPUT must
+%   contain the 18 fields documented in portable/INTERFACE.md.
 
 inputNames = [ ...
     "radar", "eo", "esm", "radar_mask", "eo_mask", "esm_mask", ...
     "ref_pos", "rotmat_b2e", "uav_pos", "fast_link", "slow_link", ...
     "fast_update", "slow_update", "imu", "fast_age", "slow_age", ...
     "esm_mode", "dt"];
+inputCounts = [ ...
+    1500, 1000, 1000, 500, 500, 500, 3, 4500, 1500, ...
+    1500, 1500, 500, 500, 3000, 500, 500, 500, 1];
 
-modelPath = string(modelPath);
-if isempty(net) || loadedModelPath ~= modelPath
-    net = importNetworkFromONNX(modelPath, GenerateCoderFiles=false);
-    loadedModelPath = modelPath;
+matlabDir = fileparts(mfilename("fullpath"));
+if exist(fullfile(matlabDir, "coop_tracker_mex." + mexext), "file") == 0
+    error("Tracker MEX is missing. Run build_mex from portable/matlab first.");
 end
 
-networkInputNames = string(net.InputNames);
-arguments = cell(1, numel(networkInputNames));
-for index = 1:numel(networkInputNames)
-    name = networkInputNames(index);
-    if ~ismember(name, inputNames)
-        error("Unexpected ONNX input: %s", name);
-    end
+arguments = cell(1, numel(inputNames));
+for index = 1:numel(inputNames)
+    name = inputNames(index);
     fieldName = char(name);
     if ~isfield(input, fieldName)
         error("Missing tracker input field: %s", name);
     end
-    arguments{index} = dlarray(single(input.(fieldName)));
+    value = single(input.(fieldName));
+    if numel(value) ~= inputCounts(index)
+        error("Input %s has %d elements; expected %d.", ...
+            name, numel(value), inputCounts(index));
+    end
+    % ONNX Runtime expects C row-major buffers. Reverse MATLAB dimensions
+    % before linearizing to preserve the public logical tensor layout.
+    order = ndims(value):-1:1;
+    value = permute(value, order);
+    arguments{index} = value(:);
 end
 
-prediction = predict(net, arguments{:});
-if isa(prediction, "dlarray")
-    prediction = extractdata(prediction);
-end
-prediction = single(gather(prediction));
+flatPrediction = coop_tracker_mex(char(string(modelPath)), arguments{:});
+prediction = permute(reshape(flatPrediction, [6, 100, 1]), [3, 2, 1]);
+prediction = single(prediction);
 end

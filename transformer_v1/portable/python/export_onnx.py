@@ -16,16 +16,21 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import torch
+from onnx import helper, numpy_helper
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tracking_system.backend.runtime import (
-    DEFAULT_DATA_DIR,
-    DEFAULT_MODEL_PATH,
-    TransformerEngine,
+from src.dataset import _parse_registered_pkl
+from src.model import CoopTrackerModel
+
+
+DEFAULT_MODEL_PATH = (
+    PROJECT_ROOT / "results" / "runs_40off(v7)" /
+    "run_20260728_103728" / "best_model.pt"
 )
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "val_data_v7_registered"
 
 
 INPUT_NAMES = [
@@ -100,10 +105,101 @@ class ExportableTracker(torch.nn.Module):
         )
 
 
-def _batched_inputs(engine: TransformerEngine, sample_path: Path) -> tuple[torch.Tensor, ...]:
+def _replace_matlab_incompatible_einsum(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Lower the two Kalman-filter Einsum patterns to basic ONNX operators.
+
+    MATLAB R2026a does not import these Einsum equations, while ONNX Runtime
+    does.  Replacing them with Unsqueeze/Mul and Unsqueeze/MatMul/Squeeze keeps
+    one shared model for Python, MATLAB, and C without custom MATLAB layers.
+    """
+    inferred = onnx.shape_inference.infer_shapes(model)
+    ranks: dict[str, int] = {}
+    values = list(inferred.graph.input) + list(inferred.graph.value_info) + list(inferred.graph.output)
+    for value in values:
+        tensor_type = value.type.tensor_type
+        if tensor_type.HasField("shape"):
+            ranks[value.name] = len(tensor_type.shape.dim)
+
+    replacement_nodes = []
+    replacement_initializers = []
+    replacements = 0
+    for index, node in enumerate(model.graph.node):
+        if node.op_type != "Einsum":
+            replacement_nodes.append(node)
+            continue
+
+        equation = next(
+            (helper.get_attribute_value(attribute).decode("ascii")
+             for attribute in node.attribute if attribute.name == "equation"),
+            "",
+        )
+        prefix = node.name or f"einsum_{index}"
+        input_a, input_b = node.input
+        output = node.output[0]
+        rank_a = ranks.get(input_a)
+        rank_b = ranks.get(input_b)
+        if rank_a is None or rank_b is None:
+            raise RuntimeError(f"Cannot determine ranks for Einsum node {prefix}")
+
+        if equation == "...i,...j->...ij":
+            axes_a = f"{prefix}_axes_a"
+            axes_b = f"{prefix}_axes_b"
+            expanded_a = f"{prefix}_expanded_a"
+            expanded_b = f"{prefix}_expanded_b"
+            replacement_initializers.extend([
+                numpy_helper.from_array(np.asarray([rank_a], dtype=np.int64), axes_a),
+                numpy_helper.from_array(np.asarray([rank_b - 1], dtype=np.int64), axes_b),
+            ])
+            replacement_nodes.extend([
+                helper.make_node("Unsqueeze", [input_a, axes_a], [expanded_a], name=f"{prefix}_UnsqueezeA"),
+                helper.make_node("Unsqueeze", [input_b, axes_b], [expanded_b], name=f"{prefix}_UnsqueezeB"),
+                helper.make_node("Mul", [expanded_a, expanded_b], [output], name=f"{prefix}_Mul"),
+            ])
+        elif equation == "...ij,...j->...i":
+            axes = f"{prefix}_axes"
+            expanded_b = f"{prefix}_expanded_b"
+            product = f"{prefix}_product"
+            replacement_initializers.append(
+                numpy_helper.from_array(np.asarray([rank_b], dtype=np.int64), axes)
+            )
+            replacement_nodes.extend([
+                helper.make_node("Unsqueeze", [input_b, axes], [expanded_b], name=f"{prefix}_Unsqueeze"),
+                helper.make_node("MatMul", [input_a, expanded_b], [product], name=f"{prefix}_MatMul"),
+                helper.make_node("Squeeze", [product, axes], [output], name=f"{prefix}_Squeeze"),
+            ])
+        else:
+            raise RuntimeError(f"Unsupported Einsum equation for MATLAB lowering: {equation}")
+        replacements += 1
+
+    if replacements != 2:
+        raise RuntimeError(f"Expected to replace 2 Einsum nodes, replaced {replacements}")
+    del model.graph.node[:]
+    model.graph.node.extend(replacement_nodes)
+    model.graph.initializer.extend(replacement_initializers)
+    return model
+
+
+def _batched_inputs(sample_path: Path, seq_len: int, num_uavs: int) -> tuple[torch.Tensor, ...]:
     with sample_path.open("rb") as handle:
         raw = pickle.load(handle)
-    sample = engine._prepare_sample(raw, sample_path, target_index=0)
+    samples = _parse_registered_pkl(raw, seq_len, num_uavs, sample_path.name)
+    if not samples:
+        raise ValueError(f"No registered targets in {sample_path.name}")
+    sample = samples[0]
+    steps = int(sample["radar"].shape[0])
+    agents = int(sample["radar"].shape[1])
+    defaults = {
+        "imu": (steps, agents, 6),
+        "fast_link": (steps, agents, 3),
+        "slow_link": (steps, agents, 3),
+        "fast_age": (steps, agents),
+        "slow_age": (steps, agents),
+        "fast_update": (steps, agents),
+        "slow_update": (steps, agents),
+        "esm_mode": (steps, agents),
+    }
+    for name, shape in defaults.items():
+        sample.setdefault(name, torch.zeros(shape, dtype=torch.float32))
 
     tensors: list[torch.Tensor] = []
     for name in INPUT_NAMES:
@@ -152,15 +248,13 @@ def main() -> None:
     if sample_path is None:
         raise FileNotFoundError(f"No PKL sample found in {args.data_dir}")
 
-    engine = TransformerEngine(
-        model_path=args.model,
-        data_dir=args.data_dir,
-        device="cpu",
-        seq_len=args.seq_len,
-        num_uavs=args.num_uavs,
-    )
-    wrapper = ExportableTracker(engine.model).eval()
-    inputs = _batched_inputs(engine, sample_path)
+    checkpoint = torch.load(args.model, map_location="cpu", weights_only=True)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        checkpoint = checkpoint["model_state_dict"]
+    model = CoopTrackerModel(d_model=96)
+    model.load_state_dict(checkpoint, strict=True)
+    wrapper = ExportableTracker(model.eval()).eval()
+    inputs = _batched_inputs(sample_path, args.seq_len, args.num_uavs)
     with torch.inference_mode():
         torch_prediction = wrapper(*inputs).detach().cpu().numpy()
 
@@ -174,7 +268,9 @@ def main() -> None:
         opset_version=17,
         do_constant_folding=True,
     )
-    onnx.checker.check_model(onnx.load(onnx_path))
+    onnx_model = _replace_matlab_incompatible_einsum(onnx.load(onnx_path))
+    onnx.checker.check_model(onnx_model)
+    onnx.save(onnx_model, onnx_path)
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     ort_inputs = {

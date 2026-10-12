@@ -158,9 +158,18 @@ class TrackAssociation:
                 ])
                 if angular > self.gateEO:
                     continue
-                radar_topology = self._topology_vector(radar_meas, radar_ids, radar_id, [0, 1])
-                eo_topology = self._topology_vector(eo_meas, eo_ids, eo_id, [0, 1])
-                topology = np.linalg.norm(radar_topology - eo_topology) / np.sqrt(self.topoK)
+                shared_neighbors = min(self.topoK, len(radar_ids) - 1, len(eo_ids) - 1)
+                if shared_neighbors > 0:
+                    radar_topology = self._topology_vector(radar_meas, radar_ids, radar_id, [0, 1])
+                    eo_topology = self._topology_vector(eo_meas, eo_ids, eo_id, [0, 1])
+                    topology = (
+                        np.linalg.norm(
+                            radar_topology[:shared_neighbors] - eo_topology[:shared_neighbors]
+                        )
+                        / np.sqrt(shared_neighbors)
+                    )
+                else:
+                    topology = 0.0
                 if topology > self.gateTopoEO:
                     continue
                 cost = angular + self.lambdaTopoEO * topology
@@ -178,9 +187,18 @@ class TrackAssociation:
                 angular = abs(wrap_pi(esm_meas[esm_id, 0] - radar_meas[radar_id, 0]))
                 if angular > self.gateESM:
                     continue
-                radar_topology = self._topology_vector(radar_meas, radar_ids, radar_id, [0])
-                esm_topology = self._topology_vector(esm_meas, esm_ids, esm_id, [0])
-                topology = np.linalg.norm(radar_topology - esm_topology) / np.sqrt(self.topoK)
+                shared_neighbors = min(self.topoK, len(radar_ids) - 1, len(esm_ids) - 1)
+                if shared_neighbors > 0:
+                    radar_topology = self._topology_vector(radar_meas, radar_ids, radar_id, [0])
+                    esm_topology = self._topology_vector(esm_meas, esm_ids, esm_id, [0])
+                    topology = (
+                        np.linalg.norm(
+                            radar_topology[:shared_neighbors] - esm_topology[:shared_neighbors]
+                        )
+                        / np.sqrt(shared_neighbors)
+                    )
+                else:
+                    topology = 0.0
                 if topology > self.gateTopoESM:
                     continue
                 cost = angular + self.lambdaTopoESM * topology

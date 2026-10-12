@@ -1,0 +1,19 @@
+python train_cv.py --data_dir data/train_data_cv_10k_many2one_registered --val_data_dir data/val_data_cv_many2many_registered --seq_len 200 --batch_size 16 --epochs 100 --num_uavs 5 
+
+python -u train_cv.py --data_dir data/train_data/single_target_registered --val_data_dir data/val_data_4models_many2many_fused_10m_registered --seq_len 200 --batch_size 16 --epochs 100 --num_uavs 5
+
+python train_cv.py --data_dir data/train_data/single_target_registered --seq_len 100 --batch_size 16 --epochs 100 --num_uavs 5 --resume_path results/run_20260710_162606/best_model.pt
+
+# 执行的训练命令：
+python train_cv.py --data_dir data/train_data_cv_many2one_registered --val_data_dir data/val_data_cv_many2many_registered --seq_len 200 --batch_size 16 --epochs 100 --num_uavs 5 --phase2_vel_weight 0.015
+
+python train_cv.py --data_dir ./data/train_data_single_new_registered --val_data_dir ./data/val_data_fused_new_registered --batch_size 4 --epochs 40 --lr 1e-4
+
+python train_cv.py --data_dir data/train_data_v2_registered --val_data_dir data/val_data_v2_registered --epochs 40 --batch_size 32
+
+python train_cv.py --data_dir data/train_data_v5_registered --val_data_dir data/val_data_v5_registered --epochs 40 --batch_size 32 --resume_path results/run_20260715_164131/best_model.pt --phase2_vel_weight 0.01
+
+python train_cv.py --data_dir data/train_data_v6_registered --val_data_dir data/val_data_v6_registered --epochs 40 --batch_size 32 --resume_path results/run_20260716_185611/best_model.pt --phase2_vel_weight 0.00
+
+python train_cv.py --data_dir data/train_data_v7_registered --val_data_dir data/val_data_v7_registered --epochs 100 --batch_size 32 --resume_path results/run_20260727_203731/best_model.pt --phase2_vel_weight 0.01
+

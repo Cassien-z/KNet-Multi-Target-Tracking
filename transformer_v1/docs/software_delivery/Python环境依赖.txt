@@ -1,0 +1,14 @@
+# 训练、配准与 ONNX 导出环境（本机 pytorch 环境中已核实的版本）
+Python 3.11.5
+torch==2.1.0
+numpy==1.26.4
+scipy==1.17.1
+h5py==3.13.0
+matplotlib==3.10.9
+onnx==1.16.2
+onnxruntime==1.18.1
+
+这些是本机可运行模型导出命令的环境版本记录，不包含 Python 或第三方安装包。
+另一个本机 Python 环境的 torch 为 2.1.1、h5py 为 3.16.0，已核实训练命令入口可加载，
+但未安装 onnx。训练所用 PyTorch CPU/CUDA 构建应按目标机器硬件安装。
+MATLAB/C 推理入口所需的 ONNX Runtime 动态库已随包提供。

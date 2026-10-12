@@ -1,5 +1,42 @@
 __pycache__/
 *.py[cod]
 .idea/
+.codex_work/
+compact_docs/
 tracking_system/frontend/node_modules/
 tracking_system/frontend/dist/
+artifacts/documentation_build/
+artifacts/docx_qa/
+artifacts/document_extraction/
+artifacts/logs/
+artifacts/*.log
+*.pdb
+
+# Local datasets, experiment artifacts and rebuildable dependencies
+/data/
+/results/
+/artifacts/
+/.codex_build/
+/portable/artifacts/
+/portable/third_party/
+/portable/c/build/
+*.mexw64
+*.dll
+*.lib
+*.obj
+*.exe
+
+# Binary documents and distribution archives are retained outside Git
+*.doc
+*.docx
+*.pptx
+*.xlsx
+*.pdf
+*.zip
+*.rar
+*.7z
+
+# Keep local credentials out of source snapshots; retain the template
+.env
+.env.*
+!.env.example

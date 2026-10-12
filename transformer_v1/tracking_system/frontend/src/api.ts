@@ -281,6 +281,8 @@ export interface BatchAssessment {
   model_id: string
   dataset_id: string
   overall_status: 'passed' | 'failed' | 'incomplete'
+  formal_evidence_complete: boolean
+  formal_evidence_requirement: string
   summary: { total: number; passed: number; failed: number; unavailable: number }
   criteria: AssessmentCriterion[]
   evidence?: {
@@ -365,6 +367,7 @@ export interface ReportRecord {
   } | null
   assessment: {
     overall_status: BatchAssessment['overall_status']
+    formal_evidence_complete: BatchAssessment['formal_evidence_complete']
     summary: BatchAssessment['summary']
   } | null
   error: string | null
